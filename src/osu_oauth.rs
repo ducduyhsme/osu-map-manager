@@ -582,6 +582,13 @@ fn expand_prefilled_path(path: &str) -> PathBuf {
         let suffix = suffix.trim_start_matches(['\\', '/']);
         return PathBuf::from(user_profile).join(suffix);
     }
+    if let Some(rest) = path.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with(['/', '\\']))
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        let suffix = rest.trim_start_matches(['\\', '/']);
+        return PathBuf::from(home).join(suffix);
+    }
     PathBuf::from(path)
 }
 

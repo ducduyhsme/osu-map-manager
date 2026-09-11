@@ -9,7 +9,7 @@ chrono = { version = "0.4", features = ["serde"] }
 eframe = "0.27"
 egui = "0.27"
 getrandom = "0.3"
-image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.24", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
 jpeg-decoder = "0.3"
 md5 = "0.7"
 sha2 = "0.10"

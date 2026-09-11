@@ -167,6 +167,7 @@ fn scan_songs_dir_streaming_inner(
         star_parse_error,
     });
     let mut maps = Vec::new();
+    let mut thread_budget = ParseThreadBudget::new(MAX_LINGERING_PARSE_THREADS);
     let cached_maps = cached_scan
         .as_ref()
         .map(|scan| {
@@ -250,6 +251,7 @@ fn scan_songs_dir_streaming_inner(
                 path.clone(),
                 Duration::from_secs(8),
                 calculate_local_stars,
+                &mut thread_budget,
             ) {
                 Ok(mut map) => {
                     if let Some(index) = &db_index
@@ -263,6 +265,7 @@ fn scan_songs_dir_streaming_inner(
                         map.stars = calculate_stars_for_path_with_timeout(
                             path.clone(),
                             Duration::from_secs(8),
+                            &mut thread_budget,
                         )
                         .ok()
                         .flatten();
@@ -335,13 +338,58 @@ fn build_sets(maps: &[LocalBeatmap]) -> Vec<LocalBeatmapSet> {
         .collect()
 }
 
+/// How many timed-out parse workers may still be running before the scan
+/// loop pauses spawning new ones.
+const MAX_LINGERING_PARSE_THREADS: usize = 4;
+
+/// Bounds pile-up of timed-out parse workers. The scan loop is sequential
+/// (spawn, wait, next), but a worker that hits the timeout keeps running
+/// detached — a run of slow files would otherwise accumulate CPU-heavy
+/// threads with no bound.
+struct ParseThreadBudget {
+    handles: Vec<thread::JoinHandle<()>>,
+    max_lingering: usize,
+}
+
+impl ParseThreadBudget {
+    fn new(max_lingering: usize) -> Self {
+        Self {
+            handles: Vec::new(),
+            max_lingering,
+        }
+    }
+
+    /// Blocks until fewer than `max_lingering` previously spawned workers are
+    /// still running, reaping finished ones along the way.
+    fn wait_for_slot(&mut self) {
+        loop {
+            self.handles.retain(|handle| !handle.is_finished());
+            if self.handles.len() < self.max_lingering.max(1) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn track(&mut self, handle: thread::JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.handles.len()
+    }
+}
+
 fn parse_osu_file_with_timeout(
     path: PathBuf,
     timeout: Duration,
     calculate_local_stars: bool,
+    budget: &mut ParseThreadBudget,
 ) -> std::result::Result<LocalBeatmap, (ParseIssueKind, anyhow::Error)> {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+    budget.wait_for_slot();
+    let handle = thread::spawn(move || {
         let mut result = parse_osu_file_inner(&path, false);
         if calculate_local_stars
             && let Ok(map) = &mut result
@@ -353,6 +401,7 @@ fn parse_osu_file_with_timeout(
         }
         let _ = tx.send(result);
     });
+    budget.track(handle);
 
     match rx.recv_timeout(timeout) {
         Ok(Ok(map)) => Ok(map),
@@ -472,14 +521,17 @@ fn calculate_stars(bytes: &[u8]) -> Option<f32> {
 fn calculate_stars_for_path_with_timeout(
     path: PathBuf,
     timeout: Duration,
+    budget: &mut ParseThreadBudget,
 ) -> std::result::Result<Option<f32>, mpsc::RecvTimeoutError> {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+    budget.wait_for_slot();
+    let handle = thread::spawn(move || {
         let stars = fs::read(path)
             .ok()
             .and_then(|bytes| calculate_stars(&bytes));
         let _ = tx.send(stars);
     });
+    budget.track(handle);
     rx.recv_timeout(timeout)
 }
 
@@ -715,6 +767,14 @@ ApproachRate:9
     }
 
     #[test]
+    fn parse_thread_budget_waits_for_lingering_workers() {
+        let mut budget = ParseThreadBudget::new(1);
+        budget.track(thread::spawn(|| {}));
+        budget.wait_for_slot();
+        assert_eq!(budget.pending(), 0);
+    }
+
+    #[test]
     fn cached_entries_are_reused_only_when_file_meta_matches() {
         assert!(cached_entry_fresh(Some(&(10, 100)), Some(&(10, 100))));
         // Changed size or mtime: re-parse.
@@ -786,7 +846,9 @@ CircleSize:4
         )
         .unwrap();
 
-        let map = parse_osu_file_with_timeout(osu_path, Duration::from_secs(1), true).unwrap();
+        let mut budget = ParseThreadBudget::new(MAX_LINGERING_PARSE_THREADS);
+        let map = parse_osu_file_with_timeout(osu_path, Duration::from_secs(1), true, &mut budget)
+            .unwrap();
 
         assert_eq!(map.mode, Some(3));
         assert!(map.has_mode_field);

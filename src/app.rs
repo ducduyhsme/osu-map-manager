@@ -1082,7 +1082,10 @@ impl MapManagerApp {
     }
 
     fn create_collection(&mut self, name: &str) {
-        let path = self.collection_db_path();
+        let Some(path) = self.collection_db_path() else {
+            self.status = "Set your Songs folder first".to_owned();
+            return;
+        };
         match collection::create_collection(&path, name) {
             Ok(()) => {
                 self.status = format!("Created collection \"{name}\" in {}", path.display());
@@ -1102,7 +1105,10 @@ impl MapManagerApp {
             return;
         }
 
-        let path = self.collection_db_path();
+        let Some(path) = self.collection_db_path() else {
+            self.status = "Set your Songs folder first".to_owned();
+            return;
+        };
         let mut hashes = self
             .selected_maps
             .iter()
@@ -1124,7 +1130,15 @@ impl MapManagerApp {
     }
 
     fn export_manifest(&mut self) {
-        let path = PathBuf::from("selected_maps.tsv");
+        // Next to the scan cache and other app state — never the process
+        // working directory, which may be read-only or surprising.
+        let path = app_data_path(&self.osu_root()).join("selected_maps.tsv");
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_err()
+        {
+            self.status = format!("Manifest export failed: cannot create {}", parent.display());
+            return;
+        }
         match collection::write_manifest(&path, &self.selected_maps) {
             Ok(()) => self.status = format!("Wrote {}", path.display()),
             Err(err) => self.status = format!("Manifest export failed: {err:#}"),
@@ -1132,7 +1146,10 @@ impl MapManagerApp {
     }
 
     fn restore_collection_backup(&mut self) {
-        let path = self.collection_db_path();
+        let Some(path) = self.collection_db_path() else {
+            self.status = "Set your Songs folder first".to_owned();
+            return;
+        };
 
         match collection::restore_collection_backup(&path) {
             Ok(()) => {
@@ -1147,12 +1164,16 @@ impl MapManagerApp {
         }
     }
 
-    fn collection_db_path(&self) -> PathBuf {
+    /// Path to osu!'s `collection.db`, or `None` when no Songs folder is set.
+    /// There is intentionally no working-directory fallback: writing a
+    /// `collection.db` next to whatever the process CWD happens to be would
+    /// silently target the wrong library.
+    fn collection_db_path(&self) -> Option<PathBuf> {
         let root = self.osu_root();
         if root.trim().is_empty() {
-            PathBuf::from("collection.db")
+            None
         } else {
-            expand_prefilled_path(&root).join("collection.db")
+            Some(expand_prefilled_path(&root).join("collection.db"))
         }
     }
 
@@ -1187,7 +1208,13 @@ impl MapManagerApp {
     }
 
     fn load_collections(&mut self) {
-        let path = self.collection_db_path();
+        let Some(path) = self.collection_db_path() else {
+            self.collections.clear();
+            self.selected_collection_index = None;
+            self.collection_missing_hashes.clear();
+            self.status = "Set your Songs folder first".to_owned();
+            return;
+        };
         match collection::load_collection_db(&path) {
             Ok(db) => {
                 let count = db.collections.len();
@@ -1252,7 +1279,10 @@ impl MapManagerApp {
     }
 
     fn save_selection_to_collection(&mut self) {
-        let path = self.collection_db_path();
+        let Some(path) = self.collection_db_path() else {
+            self.status = "Set your Songs folder first".to_owned();
+            return;
+        };
         let original_name = self
             .selected_collection_index
             .and_then(|index| self.collections.get(index))
@@ -1317,7 +1347,10 @@ impl MapManagerApp {
             return;
         };
 
-        let path = self.collection_db_path();
+        let Some(path) = self.collection_db_path() else {
+            self.status = "Set your Songs folder first".to_owned();
+            return;
+        };
         let mut db = match collection::load_collection_db(&path) {
             Ok(db) => db,
             Err(err) => {
@@ -1383,6 +1416,7 @@ impl MapManagerApp {
             }
         }
 
+        let mut removed_folders = 0_usize;
         if !deleted.is_empty() {
             scan.maps.retain(|map| !deleted.contains(&map.path));
             scan.file_meta.retain(|path, _| !deleted.contains(path));
@@ -1392,10 +1426,23 @@ impl MapManagerApp {
             let mode = self.filters.mode;
             self.retain_selected_maps(|map| !deleted.contains(&map.path) && mode.matches(map.mode));
             self.invalidate_scan_caches();
+            removed_folders = remove_empty_folders(
+                deleted
+                    .iter()
+                    .filter_map(|path| path.parent().map(Path::to_path_buf)),
+            );
         }
 
         self.status = if failures.is_empty() {
-            format!("Deleted {} non-std .osu file(s)", deleted.len())
+            format!(
+                "Deleted {} non-std .osu file(s){}",
+                deleted.len(),
+                if removed_folders > 0 {
+                    format!(", removed {removed_folders} empty folder(s)")
+                } else {
+                    String::new()
+                }
+            )
         } else {
             format!(
                 "Deleted {} non-std .osu file(s); {} deletion(s) failed: {}",
@@ -1678,9 +1725,12 @@ impl MapManagerApp {
 
         self.filtered_map_indexes.clear();
         if let Some(scan) = &self.scan {
+            let text = self.filters.lowered_text();
             self.filtered_map_indexes
                 .extend(scan.maps.iter().enumerate().filter_map(|(index, map)| {
-                    matches_visible_filters(&self.filters, map).then_some(index)
+                    self.filters
+                        .matches_local_lowered(map, &text)
+                        .then_some(index)
                 }));
         }
         self.filtered_cache_key = key;
@@ -2267,7 +2317,7 @@ impl MapManagerApp {
 
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Export TSV").on_hover_text("Write selected maps to selected_maps.tsv").clicked() {
+                        if ui.button("Export TSV").on_hover_text("Write selected maps to selected_maps.tsv in the app data folder").clicked() {
                             self.export_manifest();
                         }
                         if ui.button("Restore backup").on_hover_text("Restore collection.db from collection.db.bak").clicked() {
@@ -4063,6 +4113,23 @@ fn add_number_text_chunk(
     }
 }
 
+/// Removes folders left completely empty by file deletions. Only fully empty
+/// directories are removed — anything still holding audio, images, or other
+/// maps is left alone. Returns how many folders were removed.
+fn remove_empty_folders(folders: impl IntoIterator<Item = PathBuf>) -> usize {
+    let unique = folders.into_iter().collect::<BTreeSet<_>>();
+    let mut removed = 0;
+    for folder in unique {
+        let is_empty = fs::read_dir(&folder)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if is_empty && fs::remove_dir(&folder).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 fn build_sets_for_scan(maps: &[LocalBeatmap]) -> Vec<LocalBeatmapSet> {
     let mut grouped = BTreeMap::<(Option<i64>, PathBuf), Vec<LocalBeatmap>>::new();
     for map in maps {
@@ -4717,6 +4784,13 @@ fn expand_prefilled_path(path: &str) -> PathBuf {
         let suffix = suffix.trim_start_matches(['\\', '/']);
         return PathBuf::from(user_profile).join(suffix);
     }
+    if let Some(rest) = path.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with(['/', '\\']))
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        let suffix = rest.trim_start_matches(['\\', '/']);
+        return PathBuf::from(home).join(suffix);
+    }
 
     PathBuf::from(path)
 }
@@ -4766,6 +4840,24 @@ mod tests {
             derive_osu_root("C:\\Games\\osu!"),
             "C:\\Games\\osu!".to_owned()
         );
+    }
+
+    #[test]
+    fn only_fully_empty_folders_are_removed() {
+        let root = unique_temp_dir("osu-empty-folders");
+        let empty = root.join("empty-set");
+        let kept = root.join("has-audio");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join("audio.mp3"), b"audio").unwrap();
+
+        let removed = remove_empty_folders(vec![empty.clone(), kept.clone(), root.join("gone")]);
+
+        assert_eq!(removed, 1);
+        assert!(!empty.exists());
+        assert!(kept.exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

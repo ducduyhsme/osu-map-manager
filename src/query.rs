@@ -147,11 +147,27 @@ impl BeatmapFilters {
     }
 
     pub fn matches_local(&self, map: &LocalBeatmap) -> bool {
-        contains(&map.artist, &self.artist)
-            && contains(&map.title, &self.title)
-            && contains(&map.creator, &self.mapper)
-            && contains(&map.version, &self.difficulty)
-            && contains(&map.tags, &self.tag)
+        self.matches_local_lowered(map, &self.lowered_text())
+    }
+
+    /// Lowercases the text needles once so a full-library refresh pays 5
+    /// allocations total instead of 5 per map.
+    pub fn lowered_text(&self) -> LoweredTextQueries {
+        LoweredTextQueries {
+            artist: lowered_needle(&self.artist),
+            title: lowered_needle(&self.title),
+            mapper: lowered_needle(&self.mapper),
+            difficulty: lowered_needle(&self.difficulty),
+            tag: lowered_needle(&self.tag),
+        }
+    }
+
+    pub fn matches_local_lowered(&self, map: &LocalBeatmap, text: &LoweredTextQueries) -> bool {
+        contains_lowered(&map.artist, &text.artist)
+            && contains_lowered(&map.title, &text.title)
+            && contains_lowered(&map.creator, &text.mapper)
+            && contains_lowered(&map.version, &text.difficulty)
+            && contains_lowered(&map.tags, &text.tag)
             && within_length(map.length_seconds, &self.length_min, &self.length_max)
             && self.stars.matches(map.stars)
             && self.ar.matches(map.ar)
@@ -251,12 +267,25 @@ impl BeatmapFilters {
     }
 }
 
-fn contains(haystack: &str, needle: &str) -> bool {
-    let needle = needle.trim();
-    if needle.is_empty() {
+/// Pre-lowered text needles for one refresh pass (see `lowered_text`).
+#[derive(Debug, Clone, Default)]
+pub struct LoweredTextQueries {
+    pub artist: String,
+    pub title: String,
+    pub mapper: String,
+    pub difficulty: String,
+    pub tag: String,
+}
+
+fn lowered_needle(needle: &str) -> String {
+    needle.trim().to_lowercase()
+}
+
+fn contains_lowered(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
         return true;
     }
-    haystack.to_lowercase().contains(&needle.to_lowercase())
+    haystack.to_lowercase().contains(needle_lower)
 }
 
 fn parse_bound(text: &str) -> Option<f32> {

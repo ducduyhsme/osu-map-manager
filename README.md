@@ -45,7 +45,8 @@ cargo run
 7. Choose a collection name.
 8. Write `collection.db`.
 
-The app backs up your existing `collection.db` before replacing it.
+The app backs up your existing `collection.db` before replacing it, keeping the
+last three versions (`collection.db.bak`, `.bak.1`, `.bak.2`).
 
 ## Choosing the Songs Folder
 
@@ -111,7 +112,7 @@ Open the `Repairs and delete` tab to fix them. Each affected beatmapset lists it
 and has its own `Repair this set` button (or use `Repair all`). Repair redownloads the
 beatmapset through the built-in backend and restores only the missing files,
 so your local scores and edits are left untouched. The log reports where each download came from
-and which files were restored; rescan afterwards to confirm the issues are gone.
+and which files were restored; repaired folders are rescanned automatically afterwards.
 
 For downloads via the official osu! API, click `Sign in with osu!`. This opens osu! in your
 browser and completes through the backend Worker (which holds the OAuth client secret), then the
