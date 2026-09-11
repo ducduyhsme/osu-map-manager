@@ -78,13 +78,7 @@ pub enum ModeFilter {
 }
 
 impl ModeFilter {
-    pub const ALL: [Self; 5] = [
-        Self::Osu,
-        Self::Any,
-        Self::Taiko,
-        Self::Catch,
-        Self::Mania,
-    ];
+    pub const ALL: [Self; 5] = [Self::Osu, Self::Any, Self::Taiko, Self::Catch, Self::Mania];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -171,12 +165,25 @@ impl BeatmapFilters {
     /// Number of active filters, for the sidebar badge.
     pub fn active_count(&self) -> usize {
         let mut count = 0;
-        for text in [&self.artist, &self.title, &self.mapper, &self.difficulty, &self.tag] {
+        for text in [
+            &self.artist,
+            &self.title,
+            &self.mapper,
+            &self.difficulty,
+            &self.tag,
+        ] {
             if !text.trim().is_empty() {
                 count += 1;
             }
         }
-        for range in [&self.stars, &self.ar, &self.cs, &self.od, &self.hp, &self.bpm] {
+        for range in [
+            &self.stars,
+            &self.ar,
+            &self.cs,
+            &self.od,
+            &self.hp,
+            &self.bpm,
+        ] {
             if range.enabled {
                 count += 1;
             }
@@ -191,6 +198,8 @@ impl BeatmapFilters {
     }
 
     pub fn clear_all(&mut self) {
+        // Reset to defaults (standard mode), not to "Any": Clear means "start
+        // over", matching the initial filter state and the sidebar badge.
         let fresh = Self::with_full_ranges();
         self.artist.clear();
         self.title.clear();
@@ -205,7 +214,7 @@ impl BeatmapFilters {
         self.od = fresh.od;
         self.hp = fresh.hp;
         self.bpm = fresh.bpm;
-        self.mode = ModeFilter::Any;
+        self.mode = fresh.mode;
     }
 
     /// True when the length boxes are empty or parse as numbers.
@@ -301,10 +310,7 @@ mod tests {
         query.stars.enabled = true;
         query.stars.min = 5.5;
 
-        assert_eq!(
-            query.to_osu_search(),
-            "artist=Camellia stars>=5.5 mode=osu"
-        );
+        assert_eq!(query.to_osu_search(), "artist=Camellia stars>=5.5 mode=osu");
     }
 
     #[test]

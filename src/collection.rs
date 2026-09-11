@@ -41,11 +41,7 @@ pub fn create_collection(path: &Path, collection_name: &str) -> Result<()> {
     write_db(path, &db)
 }
 
-pub fn add_to_collection(
-    path: &Path,
-    collection_name: &str,
-    hashes: &[String],
-) -> Result<()> {
+pub fn add_to_collection(path: &Path, collection_name: &str, hashes: &[String]) -> Result<()> {
     let mut db = if path.exists() {
         load_collection_db(path)?
     } else {
@@ -120,10 +116,44 @@ pub fn write_db(path: &Path, db: &CollectionDb) -> Result<()> {
     }
 
     if path.exists() {
+        rotate_backups(path)?;
         let backup = path.with_extension("db.bak");
         fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
-    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+    write_atomic(path, &bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Writes `bytes` to `path` atomically: the data lands in a temp file in the
+/// same directory (same volume, so the final rename cannot span filesystems)
+/// and is then renamed over the destination. A crash mid-write can leave a
+/// stale `.tmp` file behind, but never a truncated destination.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
+    Ok(())
+}
+
+/// Rotates `collection.db.bak` generations so more than one previous version
+/// survives: `.bak.1` becomes `.bak.2` (dropped beyond that), `.bak` becomes
+/// `.bak.1`. The primary `.bak` keeps its role as the restore source.
+fn rotate_backups(path: &Path) -> Result<()> {
+    const GENERATIONS: usize = 2;
+    for generation in (1..=GENERATIONS).rev() {
+        let from = if generation == 1 {
+            path.with_extension("db.bak")
+        } else {
+            path.with_extension(format!("db.bak.{}", generation - 1))
+        };
+        if !from.exists() {
+            continue;
+        }
+        let to = path.with_extension(format!("db.bak.{generation}"));
+        fs::rename(&from, &to)
+            .with_context(|| format!("rotating {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
 }
 
 pub fn restore_collection_backup(path: &Path) -> Result<()> {
@@ -338,5 +368,52 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("db.bak"));
+    }
+
+    #[test]
+    fn write_db_rotates_backups_and_leaves_no_tmp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-map-manager-rotation-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collection.db");
+        let names = |path: &Path| {
+            load_collection_db(path)
+                .unwrap()
+                .collections
+                .iter()
+                .map(|collection| collection.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut v1 = CollectionDb::empty();
+        upsert_collection_hashes(&mut v1, "v1", vec!["aaa".to_owned()]);
+        write_db(&path, &v1).unwrap();
+        // First write creates no backup.
+        assert!(!path.with_extension("db.bak").exists());
+
+        let mut v2 = CollectionDb::empty();
+        upsert_collection_hashes(&mut v2, "v2", vec!["bbb".to_owned()]);
+        write_db(&path, &v2).unwrap();
+        assert_eq!(names(&path), ["v2"]);
+        assert_eq!(names(&path.with_extension("db.bak")), ["v1"]);
+        assert!(!path.with_extension("db.bak.1").exists());
+
+        let mut v3 = CollectionDb::empty();
+        upsert_collection_hashes(&mut v3, "v3", vec!["ccc".to_owned()]);
+        write_db(&path, &v3).unwrap();
+        assert_eq!(names(&path), ["v3"]);
+        assert_eq!(names(&path.with_extension("db.bak")), ["v2"]);
+        assert_eq!(names(&path.with_extension("db.bak.1")), ["v1"]);
+
+        // Atomic write leaves no temp file behind.
+        assert!(!path.with_extension("tmp").exists());
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

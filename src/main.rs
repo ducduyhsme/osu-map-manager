@@ -3,7 +3,6 @@
 mod app;
 mod collection;
 mod local;
-mod osu_api;
 mod osu_db;
 mod osu_oauth;
 mod query;

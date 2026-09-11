@@ -17,8 +17,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -212,10 +211,7 @@ pub fn build_check_targets(maps: &[LocalBeatmap]) -> (Vec<CheckTarget>, usize) {
 
 /// Beatmapset ids resolved from per-difficulty online lookups, plus diffs
 /// that could not be attributed to any online set.
-pub type ResolvedGroups = (
-    BTreeMap<i64, Vec<LocalDiffRef>>,
-    Vec<LocalDiffRef>,
-);
+pub type ResolvedGroups = (BTreeMap<i64, Vec<LocalDiffRef>>, Vec<LocalDiffRef>);
 
 #[derive(Debug, Clone)]
 pub struct CheckTarget {
@@ -230,6 +226,7 @@ pub struct CheckTarget {
 pub fn resolve_unknown_sets(
     client: &reqwest::blocking::Client,
     backend_url: &str,
+    access_token: Option<&str>,
     locals: &[LocalDiffRef],
 ) -> Result<ResolvedGroups> {
     let mut grouped = BTreeMap::<i64, Vec<LocalDiffRef>>::new();
@@ -240,7 +237,7 @@ pub fn resolve_unknown_sets(
             unresolved.push(local.clone());
             continue;
         };
-        match fetch_beatmap_blocking(client, backend_url, beatmap_id)? {
+        match fetch_beatmap_blocking(client, backend_url, access_token, beatmap_id)? {
             Some(remote) => match remote.beatmapset_id {
                 Some(set_id) => grouped.entry(set_id).or_default().push(local.clone()),
                 None => unresolved.push(local.clone()),
@@ -257,14 +254,20 @@ pub fn resolve_unknown_sets(
 pub fn fetch_set_meta_blocking(
     client: &reqwest::blocking::Client,
     backend_url: &str,
+    access_token: Option<&str>,
     beatmapset_id: i64,
 ) -> Result<Option<RemoteSetMeta>> {
     let url = format!(
         "{}/beatmapsets/{beatmapset_id}",
         backend_url.trim().trim_end_matches('/')
     );
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+    if let Some(token) = access_token
+        && !token.trim().is_empty()
+    {
+        request = request.bearer_auth(token.trim());
+    }
+    let response = request
         .send()
         .with_context(|| format!("fetching beatmapset {beatmapset_id}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -283,14 +286,20 @@ pub fn fetch_set_meta_blocking(
 pub fn fetch_beatmap_blocking(
     client: &reqwest::blocking::Client,
     backend_url: &str,
+    access_token: Option<&str>,
     beatmap_id: i64,
 ) -> Result<Option<RemoteBeatmapLookup>> {
     let url = format!(
         "{}/beatmaps/{beatmap_id}",
         backend_url.trim().trim_end_matches('/')
     );
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+    if let Some(token) = access_token
+        && !token.trim().is_empty()
+    {
+        request = request.bearer_auth(token.trim());
+    }
+    let response = request
         .send()
         .with_context(|| format!("fetching beatmap {beatmap_id}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -395,7 +404,7 @@ pub fn apply_update_blocking(
     if backend_url.trim().is_empty() {
         anyhow::bail!("backend URL is required for beatmap update downloads");
     }
-    let remote = fetch_set_meta_blocking(client, backend_url, job.beatmapset_id)?
+    let remote = fetch_set_meta_blocking(client, backend_url, access_token, job.beatmapset_id)?
         .with_context(|| {
             format!(
                 "beatmapset {} is no longer available online",
@@ -475,10 +484,7 @@ fn extract_full_into_folder(osz_path: &Path, folder: &Path) -> Result<FullExtrac
         }
         let mut output = fs::File::create(&output_path)?;
         io::copy(&mut entry, &mut output)?;
-        if let Some(file_name) = enclosed_name
-            .file_name()
-            .and_then(|name| name.to_str())
-        {
+        if let Some(file_name) = enclosed_name.file_name().and_then(|name| name.to_str()) {
             written.push(file_name.to_owned());
             if enclosed_name
                 .extension()
@@ -524,8 +530,7 @@ fn remove_stale_osu_files(
             .unwrap_or_default()
             .to_owned();
         if !archived_osu_names.contains(&file_name.to_ascii_lowercase()) {
-            fs::remove_file(&path)
-                .with_context(|| format!("removing {}", path.display()))?;
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
             removed.push(file_name);
         }
     }
@@ -559,8 +564,7 @@ fn verify_updated_checksums(
             {
                 continue;
             }
-            let bytes = fs::read(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
+            let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let md5 = format!("{:x}", md5::compute(&bytes));
             let Some(beatmap_id) = read_beatmap_id(&bytes) else {
                 continue;
@@ -679,14 +683,7 @@ mod tests {
             }],
         };
         let locals = vec![local(Some(1), "aaa", "Normal")];
-        let set = detect_outdated(
-            7,
-            "set".to_owned(),
-            None,
-            &locals,
-            &remote,
-            Vec::new(),
-        );
+        let set = detect_outdated(7, "set".to_owned(), None, &locals, &remote, Vec::new());
         assert_eq!(set.outdated_count(), 0);
         assert_eq!(set.up_to_date, 1);
     }

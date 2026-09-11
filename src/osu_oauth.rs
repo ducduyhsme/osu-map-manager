@@ -91,38 +91,79 @@ pub fn backend_url() -> String {
     from_env.unwrap_or_else(|| BACKEND_URL.to_owned())
 }
 
-pub fn authorize_url(backend_url: &str, state: &str) -> String {
+pub fn authorize_url(backend_url: &str, state: &str, code_challenge: &str) -> String {
     format!(
-        "{}/oauth/authorize?redirect_uri={}&state={}",
+        "{}/oauth/authorize?redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
         backend_base_url(backend_url),
         url_encode(OAUTH_REDIRECT_URI),
         url_encode(state),
+        url_encode(code_challenge),
     )
 }
 
+/// Unpredictable OAuth `state` (CSRF protection) from the OS RNG.
 pub fn generate_state() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let mixed = nanos
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(std::process::id() as u128);
-    base62(mixed)
+    random_alphanumeric(24)
 }
 
-fn base62(mut value: u128) -> String {
+/// PKCE code verifier (RFC 7636 §4.1): 64 unreserved characters from the OS
+/// RNG. Only the verifier's SHA-256 challenge passes through the browser;
+/// the verifier itself travels over HTTPS to the Worker.
+pub fn generate_code_verifier() -> String {
+    random_alphanumeric(64)
+}
+
+/// S256 code challenge for a verifier: BASE64URL(SHA256(verifier)) without
+/// padding (RFC 7636 §4.2).
+pub fn code_challenge_s256(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(verifier.as_bytes());
+    base64url_no_pad(&hash)
+}
+
+fn random_alphanumeric(len: usize) -> String {
     const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    if value == 0 {
-        return "0".to_owned();
+    let mut out = String::with_capacity(len);
+    // Rejection sampling (62*4 = 248) for uniform output.
+    let mut buf = vec![0_u8; len * 2];
+    if getrandom::fill(&mut buf).is_ok() {
+        for byte in buf {
+            if out.len() >= len {
+                break;
+            }
+            if byte < 248 {
+                out.push(ALPHABET[byte as usize % 62] as char);
+            }
+        }
     }
-    let mut out = Vec::new();
-    while value > 0 {
-        out.push(ALPHABET[(value % 62) as usize]);
-        value /= 62;
+    // Practically unreachable tail: only when the OS RNG itself failed.
+    let mut fallback = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    while out.len() < len {
+        fallback = fallback
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(std::process::id() as u128);
+        out.push(ALPHABET[(fallback % 62) as usize] as char);
     }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_else(|_| "state".to_owned())
+    out
+}
+
+fn base64url_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
+    for chunk in bytes.chunks(3) {
+        let mut n = 0_u32;
+        for (index, &byte) in chunk.iter().enumerate() {
+            n |= (byte as u32) << (16 - 8 * index);
+        }
+        let chars = (chunk.len() * 8).div_ceil(6);
+        for index in 0..chars {
+            out.push(ALPHABET[((n >> (18 - 6 * index)) & 0x3F) as usize] as char);
+        }
+    }
+    out
 }
 
 fn url_encode(value: &str) -> String {
@@ -146,24 +187,22 @@ pub fn login_with_state_blocking(
     client: &reqwest::blocking::Client,
     backend_url: &str,
     state: &str,
+    code_verifier: &str,
 ) -> Result<OauthSession> {
     let backend = validated_backend_base_url(backend_url)?;
     // Fail fast when the Worker itself reports bad/missing OAuth credentials
     // instead of sending the user to the browser first.
     check_backend_blocking(client, &backend)?;
-    let url = authorize_url(&backend, state);
+    let url = authorize_url(&backend, state, &code_challenge_s256(code_verifier));
     open_browser(&url).with_context(|| format!("opening {url}"))?;
     let code =
         wait_for_callback(state).context("waiting for the osu! sign-in callback in the app")?;
-    exchange_code_blocking(client, &backend, &code)
+    exchange_code_blocking(client, &backend, &code, code_verifier)
 }
 
 /// Asks the Worker whether its osu! OAuth credentials are present and accepted
 /// by osu! before starting the interactive flow.
-pub fn check_backend_blocking(
-    client: &reqwest::blocking::Client,
-    backend_url: &str,
-) -> Result<()> {
+pub fn check_backend_blocking(client: &reqwest::blocking::Client, backend_url: &str) -> Result<()> {
     let backend = validated_backend_base_url(backend_url)?;
     let response = client
         .get(format!("{backend}/oauth/check"))
@@ -203,9 +242,7 @@ pub fn validated_backend_base_url(backend_url: &str) -> Result<String> {
     }
     let lower = backend.to_ascii_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
-        anyhow::bail!(
-            "backend URL must start with http:// or https:// (got {backend:?})"
-        );
+        anyhow::bail!("backend URL must start with http:// or https:// (got {backend:?})");
     }
     Ok(backend)
 }
@@ -214,11 +251,16 @@ pub fn exchange_code_blocking(
     client: &reqwest::blocking::Client,
     backend_url: &str,
     code: &str,
+    code_verifier: &str,
 ) -> Result<OauthSession> {
     let backend = backend_base_url(backend_url);
     let response = client
         .post(format!("{backend}/oauth/token"))
-        .form(&[("code", code), ("redirect_uri", OAUTH_REDIRECT_URI)])
+        .form(&[
+            ("code", code),
+            ("redirect_uri", OAUTH_REDIRECT_URI),
+            ("code_verifier", code_verifier),
+        ])
         .send()
         .context("exchanging the osu! authorization code")?;
     token_session_from_response(response, "sign-in")
@@ -347,9 +389,7 @@ fn handle_callback_connection(
     expected_state: &str,
 ) -> Result<Option<String>> {
     let mut stream = stream;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = std::io::BufReader::new(stream.try_clone().context("reading callback")?);
     let mut request_line = String::new();
     reader
@@ -423,10 +463,9 @@ fn url_decode(value: &str) -> String {
     while index < bytes.len() {
         match bytes[index] {
             b'%' if index + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) = (
-                    hex_value(bytes[index + 1]),
-                    hex_value(bytes[index + 2]),
-                ) {
+                if let (Some(high), Some(low)) =
+                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+                {
                     out.push(high * 16 + low);
                     index += 3;
                     continue;
@@ -500,7 +539,8 @@ pub fn save_oauth_session(osu_root: &str, session: &OauthSession) -> Result<()> 
         fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(session)?;
-    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    crate::collection::write_atomic(&path, text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn clear_oauth_session(osu_root: &str) {
@@ -513,12 +553,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authorize_url_points_at_worker_with_redirect_and_state() {
-        let url = authorize_url("https://example.workers.dev/", "abc 123");
+    fn authorize_url_points_at_worker_with_redirect_state_and_pkce() {
+        let url = authorize_url("https://example.workers.dev/", "abc 123", "challenge-~_ABC");
         assert_eq!(
             url,
-            "https://example.workers.dev/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback&state=abc%20123"
+            "https://example.workers.dev/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback&state=abc%20123&code_challenge=challenge-~_ABC&code_challenge_method=S256"
         );
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc7636_vector() {
+        // Appendix B of RFC 7636.
+        assert_eq!(
+            code_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn state_and_verifier_are_unpredictable_and_well_formed() {
+        let is_alphanumeric = |value: &str| value.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        let state_a = generate_state();
+        let state_b = generate_state();
+        assert_eq!(state_a.len(), 24);
+        assert!(is_alphanumeric(&state_a));
+        assert_ne!(state_a, state_b);
+
+        let verifier = generate_code_verifier();
+        assert_eq!(verifier.len(), 64);
+        assert!(is_alphanumeric(&verifier));
+        assert_eq!(code_challenge_s256(&verifier).len(), 43);
     }
 
     #[test]
@@ -547,12 +611,16 @@ mod tests {
 
     #[test]
     fn token_errors_are_actionable() {
-        let body = r#"{"error":"invalid_client","error_description":"Client authentication failed"}"#;
+        let body =
+            r#"{"error":"invalid_client","error_description":"Client authentication failed"}"#;
         let message = friendly_token_error(body, "sign-in");
         assert!(message.contains("invalid_client"));
         assert!(message.contains("wrangler secret put OSU_CLIENT_SECRET"));
 
-        let other = friendly_token_error(r#"{"error":"invalid_grant","error_description":"nope"}"#, "sign-in");
+        let other = friendly_token_error(
+            r#"{"error":"invalid_grant","error_description":"nope"}"#,
+            "sign-in",
+        );
         assert!(other.contains("invalid_grant"));
 
         let html = friendly_token_error("<html>oops</html>", "sign-in");

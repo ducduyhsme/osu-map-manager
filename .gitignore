@@ -21,10 +21,6 @@
 /target-delete-nonstd-build
 /target-stable-scan-labels-build
 /target-map-updates-build
-backend/cloudflare-worker/node_modules
-backend/cloudflare-worker/package-lock.json
-backend/cloudflare-worker/package.json
-backend/cloudflare-worker/README.md
-backend/cloudflare-worker/src/index.ts
-backend/cloudflare-worker/wrangler.toml
-backend/cloudflare-worker/tsconfig.json
+backend/cloudflare-worker/node_modules/
+backend/cloudflare-worker/.wrangler/
+backend/cloudflare-worker/.dev.vars

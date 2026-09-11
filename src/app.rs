@@ -2,7 +2,10 @@ use crate::{
     collection,
     local::{self, LibraryScan, LocalBeatmap, LocalBeatmapSet, RepairSeverity, ScanEvent},
     osu_oauth::{self, OauthSession},
-    query::{BeatmapFilters, ModeFilter, RangeFilter, AR_RANGE, BPM_RANGE, CS_RANGE, HP_RANGE, OD_RANGE, STARS_RANGE},
+    query::{
+        AR_RANGE, BPM_RANGE, BeatmapFilters, CS_RANGE, HP_RANGE, ModeFilter, OD_RANGE, RangeFilter,
+        STARS_RANGE,
+    },
     updates::{self, OutdatedSet},
 };
 use anyhow::{Context, Result};
@@ -22,13 +25,14 @@ use std::{
 };
 
 const BEATMAPSET_DOWNLOAD_DELAY: Duration = Duration::from_secs(2);
-const SCAN_CACHE_VERSION: u32 = 4;
+const SCAN_CACHE_VERSION: u32 = 5;
 const BACKGROUND_CACHE_LIMIT: usize = 24;
 const BACKGROUND_PREVIEW_WIDTH: u16 = 1200;
 const BACKGROUND_PREVIEW_HEIGHT: u16 = 675;
 /// Fixed on-screen height of the inspector background box. Every background
 /// (and the missing-background banner) renders at exactly this size.
-const MAP_PREVIEW_HEIGHT: f32 = 270.0;/// How many neighbors on each side of the selected map get decoded ahead of
+const MAP_PREVIEW_HEIGHT: f32 = 270.0;
+/// How many neighbors on each side of the selected map get decoded ahead of
 /// time so stepping through the list usually hits the cache.
 const BACKGROUND_PREFETCH_RADIUS: usize = 3;
 /// Upper bound on concurrent background decodes so fast scrolling cannot pile
@@ -57,6 +61,10 @@ pub struct MapManagerApp {
     selected_md5s: BTreeSet<String>,
     filtered_map_indexes: Vec<usize>,
     filtered_cache_key: String,
+    /// Bumped on every scan mutation (finish, stop, prune, delete) so the
+    /// filtered-list and repair-job caches cannot go stale when the map count
+    /// alone does not change.
+    scan_generation: u64,
     repair_jobs_cache: Vec<RepairJob>,
     repair_jobs_cache_key: String,
     scan: Option<LibraryScan>,
@@ -77,6 +85,7 @@ pub struct MapManagerApp {
     repair_successes: usize,
     repair_failures: usize,
     repair_log: Vec<RepairLogEntry>,
+    repair_touched_folders: BTreeSet<PathBuf>,
     repair_ignores: RepairIgnoreStore,
     outdated_sets: Vec<OutdatedSet>,
     is_checking_updates: bool,
@@ -273,7 +282,7 @@ enum RepairEvent {
     },
     Repaired {
         beatmapset_id: i64,
-        folder_count: usize,
+        folders: Vec<PathBuf>,
         restored_files: Vec<String>,
         download_source: String,
         ignored_after_success: Vec<IgnoredRepairIssue>,
@@ -436,6 +445,7 @@ impl MapManagerApp {
             selected_md5s: BTreeSet::new(),
             filtered_map_indexes: Vec::new(),
             filtered_cache_key: String::new(),
+            scan_generation: 0,
             repair_jobs_cache: Vec::new(),
             repair_jobs_cache_key: String::new(),
             scan: cached_scan,
@@ -456,6 +466,7 @@ impl MapManagerApp {
             repair_successes: 0,
             repair_failures: 0,
             repair_log: Vec::new(),
+            repair_touched_folders: BTreeSet::new(),
             repair_ignores,
             outdated_sets: Vec::new(),
             is_checking_updates: false,
@@ -532,7 +543,12 @@ impl MapManagerApp {
                             self.matched_maps,
                         );
                     }
-                    ScanEvent::Map { map, issues } => {
+                    ScanEvent::Map {
+                        map,
+                        file_len,
+                        file_mtime_secs,
+                        issues,
+                    } => {
                         if self.scan_cancel.is_none() {
                             continue;
                         }
@@ -545,8 +561,10 @@ impl MapManagerApp {
                             .filter(|issue| !self.repair_ignores.ignores(&map, issue))
                             .collect::<Vec<_>>();
                         if let Some(scan) = &mut self.scan {
+                            scan.file_meta
+                                .insert(map.path.clone(), (file_len, file_mtime_secs));
                             scan.problems.extend(visible_issues);
-                            scan.maps.push(map);
+                            scan.maps.push(*map);
                         }
                         self.status = scan_progress_status(
                             self.scanned_maps,
@@ -562,15 +580,14 @@ impl MapManagerApp {
                     ScanEvent::Finished { sets } => {
                         self.is_scanning = false;
                         self.scan_cancel = None;
+                        self.scan_generation += 1;
                         let cache_root = self.osu_root();
                         if let Some(scan) = &mut self.scan {
                             scan.sets = sets;
                             let matching_maps = scan
                                 .maps
                                 .iter()
-                                .filter(|map| {
-                                    matches_visible_filters(&self.filters, map)
-                                })
+                                .filter(|map| matches_visible_filters(&self.filters, map))
                                 .count();
                             self.status = format!(
                                 "Scan complete: {} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
@@ -591,14 +608,13 @@ impl MapManagerApp {
                     ScanEvent::Stopped { sets } => {
                         self.is_scanning = false;
                         self.scan_cancel = None;
+                        self.scan_generation += 1;
                         if let Some(scan) = &mut self.scan {
                             scan.sets = sets;
                             let matching_maps = scan
                                 .maps
                                 .iter()
-                                .filter(|map| {
-                                    matches_visible_filters(&self.filters, map)
-                                })
+                                .filter(|map| matches_visible_filters(&self.filters, map))
                                 .count();
                             self.status = format!(
                                 "Scan stopped: {} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
@@ -652,6 +668,7 @@ impl MapManagerApp {
                         self.repair_successes = 0;
                         self.repair_failures = 0;
                         self.repair_log.clear();
+                        self.repair_touched_folders.clear();
                         self.repair_progress = format!("Preparing to repair {total} beatmapset(s)");
                         self.status = self.repair_progress.clone();
                     }
@@ -671,13 +688,15 @@ impl MapManagerApp {
                     }
                     RepairEvent::Repaired {
                         beatmapset_id,
-                        folder_count,
+                        folders,
                         restored_files,
                         download_source,
                         ignored_after_success,
                     } => {
                         self.repair_done += 1;
                         self.repair_successes += 1;
+                        self.repair_touched_folders.extend(folders.clone());
+                        let folder_count = folders.len();
                         let ignored_count = self.add_repair_ignores(ignored_after_success);
                         let restored = if restored_files.is_empty() {
                             "no missing files remained".to_owned()
@@ -716,7 +735,15 @@ impl MapManagerApp {
                             "Repair finished: {} succeeded, {} failed out of {}",
                             self.repair_successes, self.repair_failures, self.repair_total
                         );
+                        let touched = std::mem::take(&mut self.repair_touched_folders);
+                        if !touched.is_empty() {
+                            self.prune_scan_folders(&touched);
+                            self.status.push_str("; rescanning repaired files");
+                        }
                         keep_rx = false;
+                        if !touched.is_empty() && !self.is_scanning {
+                            self.start_scan();
+                        }
                     }
                 }
             }
@@ -812,7 +839,10 @@ impl MapManagerApp {
                         );
                         self.outdated_sets.push(set);
                     }
-                    UpdateCheckEvent::Unavailable { beatmapset_id, reason } => {
+                    UpdateCheckEvent::Unavailable {
+                        beatmapset_id,
+                        reason,
+                    } => {
                         self.update_unavailable += 1;
                         if let Some(set_id) = beatmapset_id {
                             upsert_log(
@@ -868,8 +898,7 @@ impl MapManagerApp {
                         self.update_successes = 0;
                         self.update_failures = 0;
                         self.update_touched_folders.clear();
-                        self.update_progress =
-                            format!("Preparing to update {total} beatmapset(s)");
+                        self.update_progress = format!("Preparing to update {total} beatmapset(s)");
                         self.status = self.update_progress.clone();
                     }
                     UpdateEvent::Opening {
@@ -905,8 +934,7 @@ impl MapManagerApp {
                                 "Updated via {download_source}: {written} file(s) written, {removed} removed upstream"
                             ),
                         );
-                        self.update_progress =
-                            format!("Updated set {beatmapset_id}");
+                        self.update_progress = format!("Updated set {beatmapset_id}");
                         self.status = self.update_progress.clone();
                     }
                     UpdateEvent::Failed {
@@ -937,8 +965,7 @@ impl MapManagerApp {
                             "Update finished: {} succeeded, {} failed out of {}",
                             self.update_successes, self.update_failures, self.update_total
                         );
-                        let touched =
-                            std::mem::take(&mut self.update_touched_folders);
+                        let touched = std::mem::take(&mut self.update_touched_folders);
                         if !touched.is_empty() {
                             self.prune_scan_folders(&touched);
                             self.status.push_str("; rescanning updated files");
@@ -984,9 +1011,8 @@ impl MapManagerApp {
                         }
                         Err(err) => {
                             if self.background_preview_path.as_deref() == Some(&path) {
-                                self.background_preview_error = Some(format!(
-                                    "Could not load background: {err:#}"
-                                ));
+                                self.background_preview_error =
+                                    Some(format!("Could not load background: {err:#}"));
                             }
                         }
                     }
@@ -1024,8 +1050,7 @@ impl MapManagerApp {
         self.scanned_maps = 0;
         self.scan_total = 0;
         self.matched_maps = 0;
-        self.status =
-            scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps);
+        self.status = scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps);
         std::thread::spawn(move || {
             local::scan_songs_dir_streaming(
                 songs_dir,
@@ -1046,8 +1071,9 @@ impl MapManagerApp {
     fn stop_scan(&mut self) {
         if let Some(cancel) = &self.scan_cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.is_scanning = false;
-            self.scan_cancel = None;
+            // Leave `is_scanning` set until the worker answers with `Stopped`:
+            // clearing it here would let a second scan start while the first
+            // worker is still alive. Repeated clicks are idempotent.
             self.status = format!(
                 "Scan stop requested: {}/{} maps read, {} match current filters",
                 self.scanned_maps, self.scan_total, self.matched_maps
@@ -1090,8 +1116,7 @@ impl MapManagerApp {
 
         match collection::add_to_collection(&path, name, &hashes) {
             Ok(()) => {
-                self.status =
-                    format!("Added {} map(s) to collection \"{name}\"", hashes.len());
+                self.status = format!("Added {} map(s) to collection \"{name}\"", hashes.len());
                 self.load_collections();
             }
             Err(err) => self.status = format!("Add to collection failed: {err:#}"),
@@ -1360,13 +1385,12 @@ impl MapManagerApp {
 
         if !deleted.is_empty() {
             scan.maps.retain(|map| !deleted.contains(&map.path));
+            scan.file_meta.retain(|path, _| !deleted.contains(path));
             scan.problems
                 .retain(|issue| !deleted.contains(&issue.beatmap));
             scan.sets = build_sets_for_scan(&scan.maps);
             let mode = self.filters.mode;
-            self.retain_selected_maps(|map| {
-                !deleted.contains(&map.path) && mode.matches(map.mode)
-            });
+            self.retain_selected_maps(|map| !deleted.contains(&map.path) && mode.matches(map.mode));
             self.invalidate_scan_caches();
         }
 
@@ -1457,8 +1481,17 @@ impl MapManagerApp {
         self.update_log.clear();
         self.status = format!("Starting update check for {} beatmapset(s)", targets.len());
         let backend_url = osu_oauth::backend_url();
+        let osu_root = self.osu_root();
+        let oauth_session = self.oauth_session.clone();
         std::thread::spawn(move || {
-            run_update_check(targets, uncheckable, backend_url, tx);
+            run_update_check(
+                targets,
+                uncheckable,
+                backend_url,
+                osu_root,
+                oauth_session,
+                tx,
+            );
         });
     }
 
@@ -1524,6 +1557,8 @@ impl MapManagerApp {
             return;
         };
         scan.maps.retain(|map| !folders.contains(&map.folder));
+        scan.file_meta
+            .retain(|path, _| path.parent().is_none_or(|parent| !folders.contains(parent)));
         scan.problems.retain(|issue| {
             issue
                 .beatmap
@@ -1559,7 +1594,12 @@ impl MapManagerApp {
             }
         };
         let state = osu_oauth::generate_state();
-        self.oauth_pending_url = Some(osu_oauth::authorize_url(&backend, &state));
+        let code_verifier = osu_oauth::generate_code_verifier();
+        self.oauth_pending_url = Some(osu_oauth::authorize_url(
+            &backend,
+            &state,
+            &osu_oauth::code_challenge_s256(&code_verifier),
+        ));
         let (tx, rx) = mpsc::channel();
         self.oauth_rx = Some(rx);
         self.is_signing_in = true;
@@ -1570,7 +1610,12 @@ impl MapManagerApp {
                 .timeout(Duration::from_secs(30))
                 .build();
             let result = match client {
-                Ok(client) => osu_oauth::login_with_state_blocking(&client, &backend_url, &state),
+                Ok(client) => osu_oauth::login_with_state_blocking(
+                    &client,
+                    &backend_url,
+                    &state,
+                    &code_verifier,
+                ),
                 Err(err) => Err(err.into()),
             };
             let _ = tx.send(result);
@@ -1597,15 +1642,16 @@ impl MapManagerApp {
                 added += 1;
             }
         }
-        if added > 0 {
-            if let Err(err) = save_repair_ignores(&self.osu_root(), &self.repair_ignores) {
-                self.status = format!("Repair ignore save failed: {err:#}");
-            }
+        if added > 0
+            && let Err(err) = save_repair_ignores(&self.osu_root(), &self.repair_ignores)
+        {
+            self.status = format!("Repair ignore save failed: {err:#}");
         }
         added
     }
 
     fn invalidate_scan_caches(&mut self) {
+        self.scan_generation += 1;
         self.filtered_cache_key.clear();
         self.filtered_map_indexes.clear();
         self.repair_jobs_cache_key.clear();
@@ -1613,8 +1659,15 @@ impl MapManagerApp {
     }
 
     fn filtered_cache_key(&self) -> String {
+        // Generation (not just the map count) keys the cache, so any scan
+        // mutation refreshes the list even when the count does not change.
+        // The count is kept too so the list still grows live while scanning.
         let map_count = self.scan.as_ref().map_or(0, |scan| scan.maps.len());
-        serde_json::to_string(&self.filters).unwrap_or_default() + &map_count.to_string()
+        serde_json::to_string(&self.filters).unwrap_or_default()
+            + "#"
+            + &self.scan_generation.to_string()
+            + "#"
+            + &map_count.to_string()
     }
 
     fn refresh_filtered_maps(&mut self) {
@@ -1637,7 +1690,12 @@ impl MapManagerApp {
         let Some(scan) = &self.scan else {
             return String::new();
         };
-        format!("{}:{}", scan.maps.len(), scan.problems.len())
+        format!(
+            "{}:{}:{}",
+            self.scan_generation,
+            scan.maps.len(),
+            scan.problems.len()
+        )
     }
 
     fn refresh_repair_jobs(&mut self) {
@@ -1672,20 +1730,20 @@ impl MapManagerApp {
 
     fn retain_selected_maps(&mut self, mut keep: impl FnMut(&LocalBeatmap) -> bool) {
         self.selected_maps.retain(|map| keep(map));
-        self.selected_md5s = self
-            .selected_maps
-            .iter()
-            .map(|map| map.md5.clone())
-            .collect();
+        self.selected_md5s = reconcile_selected_md5s(
+            &self.selected_maps,
+            &self.collection_missing_hashes,
+            &self.selected_md5s,
+        );
     }
 
     fn map_result_label(&self, map: &LocalBeatmap) -> String {
         let mut fields = filter_label_values(&self.filters, map);
 
-        if fields.is_empty() {
-            if let Some(stars) = map.stars {
-                fields.push(format!("*{}", format_number(stars)));
-            }
+        if fields.is_empty()
+            && let Some(stars) = map.stars
+        {
+            fields.push(format!("*{}", format_number(stars)));
         }
 
         let title = format!("{} - {}", map.artist, map.title);
@@ -1714,7 +1772,7 @@ impl MapManagerApp {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(0x20, 0x21, 0x24))
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
                         ))
                         .show(ui, |ui| {
@@ -1730,9 +1788,7 @@ impl MapManagerApp {
                     let inspected_map = self.expanded_map_md5.as_ref().and_then(|md5| {
                         self.scan
                             .as_ref()
-                            .and_then(|scan| {
-                                scan.maps.iter().find(|map| &map.md5 == md5)
-                            })
+                            .and_then(|scan| scan.maps.iter().find(|map| &map.md5 == md5))
                             .cloned()
                     });
                     if let Some(map) = inspected_map {
@@ -1811,7 +1867,7 @@ impl MapManagerApp {
                     ui.painter().rect_filled(header_rect, 0.0, fill);
                     ui.painter().line_segment(
                         [header_rect.left_bottom(), header_rect.right_bottom()],
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x36, 0x37, 0x3b)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x36, 0x37, 0x3b)),
                     );
 
                     let mut selected_value = selected;
@@ -1826,11 +1882,9 @@ impl MapManagerApp {
                     let selection_changed = ui
                         .push_id(("map_select", &map.md5), |ui| {
                             ui.allocate_ui_at_rect(checkbox_area, |ui| {
-                                ui.centered_and_justified(|ui| {
-                                    ui.checkbox(&mut selected_value, "")
-                                })
-                                .inner
-                                .changed()
+                                ui.centered_and_justified(|ui| ui.checkbox(&mut selected_value, ""))
+                                    .inner
+                                    .changed()
                             })
                             .inner
                         })
@@ -1844,7 +1898,10 @@ impl MapManagerApp {
                     }
 
                     let content_rect = egui::Rect::from_min_max(
-                        egui::pos2(header_rect.left() + checkbox_column_width, header_rect.top()),
+                        egui::pos2(
+                            header_rect.left() + checkbox_column_width,
+                            header_rect.top(),
+                        ),
                         header_rect.right_bottom(),
                     );
                     let row_response = ui.interact(
@@ -1913,185 +1970,182 @@ impl MapManagerApp {
                 .max_height(max_height.max(1.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-            fill_tile_width(ui);
-            if let Some(texture) = preview {
-                    // Fixed box, filled edge-to-edge (cover): every background
-                    // shows at exactly the same size no matter its resolution.
-                    let source_size = texture.size_vec2();
-                    let box_size =
-                        egui::vec2(ui.available_width().max(1.0), MAP_PREVIEW_HEIGHT);
-                    let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
-                    if source_size.x > 0.0 && source_size.y > 0.0 {
-                        let scale = (box_rect.width() / source_size.x)
-                            .max(box_rect.height() / source_size.y);
-                        let shown_rect = egui::Rect::from_center_size(
-                            box_rect.center(),
-                            source_size * scale,
+                    fill_tile_width(ui);
+                    if let Some(texture) = preview {
+                        // Fixed box, filled edge-to-edge (cover): every background
+                        // shows at exactly the same size no matter its resolution.
+                        let source_size = texture.size_vec2();
+                        let box_size =
+                            egui::vec2(ui.available_width().max(1.0), MAP_PREVIEW_HEIGHT);
+                        let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+                        if source_size.x > 0.0 && source_size.y > 0.0 {
+                            let scale = (box_rect.width() / source_size.x)
+                                .max(box_rect.height() / source_size.y);
+                            let shown_rect = egui::Rect::from_center_size(
+                                box_rect.center(),
+                                source_size * scale,
+                            );
+                            let previous_clip = ui.clip_rect();
+                            ui.set_clip_rect(box_rect.intersect(previous_clip));
+                            ui.painter().image(
+                                texture.id(),
+                                shown_rect,
+                                egui::Rect::from_min_max(
+                                    egui::Pos2::ZERO,
+                                    egui::Pos2::new(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                            ui.set_clip_rect(previous_clip);
+                        }
+                    } else {
+                        let message = preview_error.unwrap_or_else(|| {
+                            if background_path.is_some() {
+                                "Background file is unavailable".to_owned()
+                            } else {
+                                "This map does not define a background".to_owned()
+                            }
+                        });
+                        // Same box as a real background, so the list never jumps.
+                        let box_size =
+                            egui::vec2(ui.available_width().max(1.0), MAP_PREVIEW_HEIGHT);
+                        let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            box_rect,
+                            egui::Rounding::ZERO,
+                            egui::Color32::from_rgb(0x1b, 0x1c, 0x1f),
                         );
-                        let previous_clip = ui.clip_rect();
-                        ui.set_clip_rect(box_rect.intersect(previous_clip));
-                        ui.painter().image(
-                            texture.id(),
-                            shown_rect,
-                            egui::Rect::from_min_max(
-                                egui::Pos2::ZERO,
-                                egui::Pos2::new(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
+                        ui.painter().rect_stroke(
+                            box_rect,
+                            egui::Rounding::ZERO,
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x3a, 0x3b, 0x40)),
                         );
-                        ui.set_clip_rect(previous_clip);
+                        ui.allocate_ui_at_rect(box_rect, |ui| {
+                            ui.centered_and_justified(|ui| muted_label(ui, message));
+                        });
                     }
-                } else {
-                    let message = preview_error.unwrap_or_else(|| {
-                        if background_path.is_some() {
-                            "Background file is unavailable".to_owned()
-                        } else {
-                            "This map does not define a background".to_owned()
-                        }
-                    });
-                    // Same box as a real background, so the list never jumps.
-                    let box_size =
-                        egui::vec2(ui.available_width().max(1.0), MAP_PREVIEW_HEIGHT);
-                    let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        box_rect,
-                        egui::Rounding::ZERO,
-                        egui::Color32::from_rgb(0x1b, 0x1c, 0x1f),
-                    );
-                    ui.painter().rect_stroke(
-                        box_rect,
-                        egui::Rounding::ZERO,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3b, 0x40)),
-                    );
-                    ui.allocate_ui_at_rect(box_rect, |ui| {
-                        ui.centered_and_justified(|ui| muted_label(ui, message));
-                    });
-                }
 
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!("{} - {}", map.artist, map.title))
-                        .size(18.0)
-                        .strong(),
-                );
-                muted_label(ui, format!("{} · mapped by {}", map.version, map.creator));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("{} - {}", map.artist, map.title))
+                            .size(18.0)
+                            .strong(),
+                    );
+                    muted_label(ui, format!("{} · mapped by {}", map.version, map.creator));
 
-                let audio_path = map
-                    .audio_filename
-                    .as_ref()
-                    .map(|filename| map.folder.join(filename));
-                let audio_available = audio_path.as_ref().is_some_and(|path| path.exists());
-                let is_current_audio = audio_path.as_ref().is_some_and(|path| {
-                    self.audio_player
+                    let audio_path = map
+                        .audio_filename
                         .as_ref()
-                        .is_some_and(|player| player.path == *path)
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if is_current_audio {
-                        let paused = self
-                            .audio_player
+                        .map(|filename| map.folder.join(filename));
+                    let audio_available = audio_path.as_ref().is_some_and(|path| path.exists());
+                    let is_current_audio = audio_path.as_ref().is_some_and(|path| {
+                        self.audio_player
                             .as_ref()
-                            .is_some_and(|player| player.sink.is_paused());
-                        if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
-                            self.toggle_audio_pause();
-                        }
-                        if ui.button("Stop").clicked() {
-                            self.stop_audio_playback();
-                        }
-                    } else if ui
-                        .add_enabled(audio_available, egui::Button::new("Play audio"))
-                        .clicked()
-                    {
-                        if let Some(path) = audio_path.as_deref() {
+                            .is_some_and(|player| player.path == *path)
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if is_current_audio {
+                            let paused = self
+                                .audio_player
+                                .as_ref()
+                                .is_some_and(|player| player.sink.is_paused());
+                            if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                                self.toggle_audio_pause();
+                            }
+                            if ui.button("Stop").clicked() {
+                                self.stop_audio_playback();
+                            }
+                        } else if ui
+                            .add_enabled(audio_available, egui::Button::new("Play audio"))
+                            .clicked()
+                            && let Some(path) = audio_path.as_deref()
+                        {
                             self.start_audio_playback(path);
                         }
-                    }
-                    if ui.button("Open map folder").clicked() {
-                        self.open_map_path(&map.folder, "map folder");
-                    }
-                });
-                if is_current_audio {
-                    ui.horizontal(|ui| {
-                        ui.label("Volume");
-                        let changed = ui
-                            .add(
-                                egui::Slider::new(&mut self.audio_volume, 0.0..=1.0)
-                                    .show_value(false),
-                            )
-                            .changed();
-                        if changed {
-                            if let Some(player) = &self.audio_player {
+                        if ui.button("Open map folder").clicked() {
+                            self.open_map_path(&map.folder, "map folder");
+                        }
+                    });
+                    if is_current_audio {
+                        ui.horizontal(|ui| {
+                            ui.label("Volume");
+                            let changed = ui
+                                .add(
+                                    egui::Slider::new(&mut self.audio_volume, 0.0..=1.0)
+                                        .show_value(false),
+                                )
+                                .changed();
+                            if changed && let Some(player) = &self.audio_player {
                                 player.sink.set_volume(self.audio_volume);
                             }
-                        }
-                        if let Some(filename) = &map.audio_filename {
-                            muted_label(ui, format!("FFmpeg | {filename}"));
-                        }
-                    });
-                } else if let Some(filename) = &map.audio_filename {
-                    muted_label(ui, filename);
-                }
-
-                if !audio_available {
-                    if map.audio_filename.is_some() {
-                        muted_label(ui, "The referenced audio file is missing.");
-                    } else {
-                        muted_label(ui, "This map does not define an audio file.");
+                            if let Some(filename) = &map.audio_filename {
+                                muted_label(ui, format!("FFmpeg | {filename}"));
+                            }
+                        });
+                    } else if let Some(filename) = &map.audio_filename {
+                        muted_label(ui, filename);
                     }
-                }
 
-                ui.separator();
-                egui::Grid::new(("map_info", &map.md5))
-                    .num_columns(4)
-                    .spacing(egui::vec2(14.0, 6.0))
-                    .show(ui, |ui| {
-                        inspector_grid_value(ui, "Mode", mode_label(map.mode));
-                        inspector_grid_value(
-                            ui,
-                            "Length",
-                            map.length_seconds
-                                .map(format_duration)
-                                .unwrap_or_else(|| "—".to_owned()),
-                        );
-                        ui.end_row();
-                        inspector_grid_value(
-                            ui,
-                            "Stars",
-                            map.stars
-                                .map(format_number)
-                                .unwrap_or_else(|| "—".to_owned()),
-                        );
-                        inspector_grid_value(
-                            ui,
-                            "BPM",
-                            map.bpm.map(format_number).unwrap_or_else(|| "—".to_owned()),
-                        );
-                        ui.end_row();
-                        inspector_grid_value(ui, "AR", optional_number(map.ar));
-                        inspector_grid_value(ui, "CS", optional_number(map.cs));
-                        ui.end_row();
-                        inspector_grid_value(ui, "OD", optional_number(map.od));
-                        inspector_grid_value(ui, "HP", optional_number(map.hp));
-                        ui.end_row();
-                        inspector_grid_value(ui, "Circles", map.circles.to_string());
-                        inspector_grid_value(ui, "Sliders", map.sliders.to_string());
-                        ui.end_row();
-                        inspector_grid_value(
-                            ui,
-                            "Map ID",
-                            map.beatmap_id
-                                .map_or_else(|| "—".to_owned(), |id| id.to_string()),
-                        );
-                        inspector_grid_value(
-                            ui,
-                            "Set ID",
-                            map.beatmapset_id
-                                .map_or_else(|| "—".to_owned(), |id| id.to_string()),
-                        );
-                        ui.end_row();
-                    });
+                    if !audio_available {
+                        if map.audio_filename.is_some() {
+                            muted_label(ui, "The referenced audio file is missing.");
+                        } else {
+                            muted_label(ui, "This map does not define an audio file.");
+                        }
+                    }
+
+                    ui.separator();
+                    egui::Grid::new(("map_info", &map.md5))
+                        .num_columns(4)
+                        .spacing(egui::vec2(14.0, 6.0))
+                        .show(ui, |ui| {
+                            inspector_grid_value(ui, "Mode", mode_label(map.mode));
+                            inspector_grid_value(
+                                ui,
+                                "Length",
+                                map.length_seconds
+                                    .map(format_duration)
+                                    .unwrap_or_else(|| "—".to_owned()),
+                            );
+                            ui.end_row();
+                            inspector_grid_value(
+                                ui,
+                                "Stars",
+                                map.stars
+                                    .map(format_number)
+                                    .unwrap_or_else(|| "—".to_owned()),
+                            );
+                            inspector_grid_value(
+                                ui,
+                                "BPM",
+                                map.bpm.map(format_number).unwrap_or_else(|| "—".to_owned()),
+                            );
+                            ui.end_row();
+                            inspector_grid_value(ui, "AR", optional_number(map.ar));
+                            inspector_grid_value(ui, "CS", optional_number(map.cs));
+                            ui.end_row();
+                            inspector_grid_value(ui, "OD", optional_number(map.od));
+                            inspector_grid_value(ui, "HP", optional_number(map.hp));
+                            ui.end_row();
+                            inspector_grid_value(ui, "Circles", map.circles.to_string());
+                            inspector_grid_value(ui, "Sliders", map.sliders.to_string());
+                            ui.end_row();
+                            inspector_grid_value(
+                                ui,
+                                "Map ID",
+                                map.beatmap_id
+                                    .map_or_else(|| "—".to_owned(), |id| id.to_string()),
+                            );
+                            inspector_grid_value(
+                                ui,
+                                "Set ID",
+                                map.beatmapset_id
+                                    .map_or_else(|| "—".to_owned(), |id| id.to_string()),
+                            );
+                            ui.end_row();
+                        });
                 });
-            });
+        });
     }
 
     fn render_collections_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2347,10 +2401,8 @@ impl MapManagerApp {
         if new_collection {
             self.create_collection(&self.collection_name.clone());
         }
-        if add_to_collection {
-            if let Some(name) = selected_collection_name.as_deref() {
-                self.add_selected_to_collection(name);
-            }
+        if add_to_collection && let Some(name) = selected_collection_name.as_deref() {
+            self.add_selected_to_collection(name);
         }
     }
 
@@ -2486,11 +2538,11 @@ impl MapManagerApp {
         let Some(scan) = &self.scan else {
             return Vec::new();
         };
-        let Some(position) = self.filtered_map_indexes.iter().position(|&index| {
-            scan.maps
-                .get(index)
-                .is_some_and(|map| map.md5 == md5)
-        }) else {
+        let Some(position) = self
+            .filtered_map_indexes
+            .iter()
+            .position(|&index| scan.maps.get(index).is_some_and(|map| map.md5 == md5))
+        else {
             return Vec::new();
         };
         let mut paths = Vec::new();
@@ -2557,10 +2609,8 @@ impl MapManagerApp {
             .audio_player
             .as_ref()
             .is_some_and(|player| player.sink.empty());
-        if finished {
-            if let Some(player) = self.audio_player.take() {
-                self.status = format!("Finished audio: {}", player.path.display());
-            }
+        if finished && let Some(player) = self.audio_player.take() {
+            self.status = format!("Finished audio: {}", player.path.display());
         }
     }
 
@@ -2576,7 +2626,11 @@ impl eframe::App for MapManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
         self.poll_audio_playback();
-        if self.is_scanning || self.is_repairing || self.audio_player.is_some() || !self.background_in_flight.is_empty() {
+        if self.is_scanning
+            || self.is_repairing
+            || self.audio_player.is_some()
+            || !self.background_in_flight.is_empty()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
@@ -2621,15 +2675,15 @@ impl eframe::App for MapManagerApp {
                                 .on_hover_text(filename);
                         } else if self.oauth_session.is_some() {
                             ui.label(
-                                egui::RichText::new("● signed in").small().color(
-                                    egui::Color32::from_rgb(0x7f, 0xa6, 0x86),
-                                ),
+                                egui::RichText::new("● signed in")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0x7f, 0xa6, 0x86)),
                             );
                         } else {
                             ui.label(
-                                egui::RichText::new("○ not signed in").small().color(
-                                    egui::Color32::from_rgb(0xb3, 0xad, 0xa5),
-                                ),
+                                egui::RichText::new("○ not signed in")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0xb3, 0xad, 0xa5)),
                             );
                         }
                     });
@@ -2847,9 +2901,6 @@ impl eframe::App for MapManagerApp {
         let mut sign_in_requested = false;
         let mut sign_out_requested = false;
         let mut delete_non_std_requested = false;
-        let mut load_collections_requested = false;
-        let mut load_collection_selection_requested = false;
-        let mut save_collection_requested = false;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ctx.style().as_ref()))
@@ -2948,259 +2999,6 @@ impl eframe::App for MapManagerApp {
                                 self.render_map_workspace(ui, ctx, list_height);
                             });
                         }
-                        // Legacy side panel below: permanently hidden (zero width).
-                        // Dead code kept compiling for reference; the Collections
-                        // tab now owns all collection management. TODO: delete it
-                        // together with its request flags.
-                        let gap: f32 = 8.0;
-                        let actions_width: f32 = 0.0;
-                        let actions_rect = egui::Rect::NOTHING;
-                if actions_width > 1.0 {
-                    let mut actions_ui = ui.child_ui_with_id_source(
-                        actions_rect,
-                        egui::Layout::top_down(egui::Align::Min),
-                        "actions_fixed",
-                    );
-                    actions_ui.set_clip_rect(actions_rect);
-                    actions_ui.set_width(actions_width);
-                    actions_ui.set_max_width(actions_width);
-                    egui::ScrollArea::vertical()
-                        .id_source("actions_pane")
-                        .auto_shrink([false, false])
-                        .show(&mut actions_ui, |ui| {
-                            let actions_content_width = ui.available_width().max(1.0);
-                            let card_item_spacing = ui.spacing().item_spacing;
-                            let card_gap = gap;
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            fix_ui_width(ui, actions_content_width);
-                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = card_item_spacing;
-                                fill_tile_width(ui);
-                                ui.heading("Collection management");
-                            });
-
-                            ui.add_space(card_gap);
-                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = card_item_spacing;
-                                fill_tile_width(ui);
-                                ui.heading("Collections");
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.button("Load collection.db").clicked() {
-                                        load_collections_requested = true;
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.selected_collection_index.is_some(),
-                                            egui::Button::new("Load selected"),
-                                        )
-                                        .clicked()
-                                    {
-                                        load_collection_selection_requested = true;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Name");
-                                    let input_width = (ui.available_width() - 8.0).max(80.0);
-                                    ui.add_sized(
-                                        [input_width, 28.0],
-                                        egui::TextEdit::singleline(&mut self.collection_name)
-                                            .vertical_align(egui::Align::Center),
-                                    );
-                                });
-                                muted_label(
-                                    ui,
-                                    format!("{} selected map(s)", self.selected_maps.len()),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui
-                                        .add_enabled(
-                                            !self.collection_name.trim().is_empty(),
-                                            egui::Button::new("Save selection"),
-                                        )
-                                        .clicked()
-                                    {
-                                        save_collection_requested = true;
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.selected_collection_index.is_some(),
-                                            egui::Button::new("Delete selected"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.delete_confirmation = self
-                                            .selected_collection_index
-                                            .and_then(|i| self.collections.get(i))
-                                            .map(|c| DeleteIntent::Collection(c.name.clone()));
-                                    }
-                                });
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.button("Write TSV manifest").clicked() {
-                                        self.export_manifest();
-                                    }
-                                    ui.add_enabled_ui(true, |ui| {
-                                        if ui.button("Restore backup").clicked() {
-                                            self.delete_confirmation =
-                                                Some(DeleteIntent::RestoreBackup);
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text("Restore collection.db from collection.db.bak");
-                                });
-
-                                if self.collections.is_empty() {
-                                    muted_label(ui, "No collections loaded.");
-                                } else {
-                                    let selected_name = self
-                                        .selected_collection_index
-                                        .and_then(|index| self.collections.get(index))
-                                        .map(|collection| collection.name.as_str())
-                                        .unwrap_or("Choose collection");
-                                    egui::ComboBox::from_id_source("existing_collections")
-                                        .selected_text(selected_name)
-                                        .width(ui.available_width())
-                                        .show_ui(ui, |ui| {
-                                            let previous_index = self.selected_collection_index;
-                                            for (index, collection) in
-                                                self.collections.iter().enumerate()
-                                            {
-                                                ui.selectable_value(
-                                                    &mut self.selected_collection_index,
-                                                    Some(index),
-                                                    format!(
-                                                        "{} ({} map{})",
-                                                        collection.name,
-                                                        collection.hashes.len(),
-                                                        if collection.hashes.len() == 1 {
-                                                            ""
-                                                        } else {
-                                                            "s"
-                                                        }
-                                                    ),
-                                                );
-                                            }
-                                            if self.selected_collection_index != previous_index {
-                                                load_collection_selection_requested = true;
-                                            }
-                                        });
-
-                                    if let Some(collection) = self
-                                        .selected_collection_index
-                                        .and_then(|index| self.collections.get(index))
-                                        .cloned()
-                                    {
-                                        let matched = self.scan.as_ref().map_or(0, |scan| {
-                                            let scanned_hashes = scan
-                                                .maps
-                                                .iter()
-                                                .map(|map| map.md5.as_str())
-                                                .collect::<BTreeSet<_>>();
-                                            collection
-                                                .hashes
-                                                .iter()
-                                                .filter(|hash| scanned_hashes.contains(hash.as_str()))
-                                                .count()
-                                        });
-                                        muted_label(
-                                            ui,
-                                            format!(
-                                                "{} map(s), {} matched in current scan",
-                                                collection.hashes.len(),
-                                                matched
-                                            ),
-                                        );
-                                        egui::ScrollArea::vertical()
-                                            .id_source("collection_maps")
-                                            .max_height(180.0)
-                                            .show(ui, |ui| {
-                                                let scanned_maps =
-                                                    self.scan.as_ref().map(|scan| {
-                                                        scan.maps
-                                                            .iter()
-                                                            .map(|map| (map.md5.clone(), map.clone()))
-                                                            .collect::<BTreeMap<_, _>>()
-                                                    });
-                                                let mut shown = 0_usize;
-                                                for hash in &collection.hashes {
-                                                    if shown >= 80 {
-                                                        break;
-                                                    }
-                                                    let mut selected =
-                                                        self.selected_md5s.contains(hash);
-                                                    if let Some(map) = scanned_maps
-                                                        .as_ref()
-                                                        .and_then(|maps| maps.get(hash.as_str()))
-                                                    {
-                                                        let label = self.map_result_label(map);
-                                                        let changed = ui
-                                                            .horizontal(|ui| {
-                                                                let changed = ui
-                                                                    .checkbox(&mut selected, "")
-                                                                    .changed();
-                                                                wrapped_label(ui, label);
-                                                                changed
-                                                            })
-                                                            .inner;
-                                                        if changed {
-                                                            if selected {
-                                                                self.select_map(map);
-                                                            } else {
-                                                                self.deselect_md5(hash);
-                                                            }
-                                                        }
-                                                    } else if self.scan.is_some() {
-                                                        let changed = ui
-                                                            .horizontal(|ui| {
-                                                                let changed = ui
-                                                                    .checkbox(&mut selected, "")
-                                                                    .changed();
-                                                                scan_status_label(
-                                                                    ui, "missing", hash,
-                                                                );
-                                                                changed
-                                                            })
-                                                            .inner;
-                                                        if changed {
-                                                            if selected {
-                                                                self.select_missing_hash(hash);
-                                                            } else {
-                                                                self.deselect_md5(hash);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        muted_label(
-                                                            ui,
-                                                            "Scan Songs to resolve this collection's hashes to local maps.",
-                                                        );
-                                                        break;
-                                                    }
-                                                    shown += 1;
-                                                }
-                                                if collection.hashes.len() > shown {
-                                                    muted_label(
-                                                        ui,
-                                                        format!(
-                                                            "{} more map(s)",
-                                                            collection.hashes.len() - shown
-                                                        ),
-                                                    );
-                                                }
-                                            });
-                                    }
-                                }
-                                if !self.collection_missing_hashes.is_empty() {
-                                    muted_label(
-                                        ui,
-                                        format!(
-                                            "{} loaded hash(es) are not present in the current scan and will be preserved while still selected.",
-                                            self.collection_missing_hashes.len()
-                                        ),
-                                    );
-                                }
-                            });
-
-                    });
-                }
                     }
                     AppTab::Collections => {
                         self.render_collections_page(ui, ctx);
@@ -3669,7 +3467,11 @@ impl eframe::App for MapManagerApp {
             .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if self.is_scanning || self.is_repairing || self.is_checking_updates || self.is_updating {
+                    if self.is_scanning
+                        || self.is_repairing
+                        || self.is_checking_updates
+                        || self.is_updating
+                    {
                         ui.add(egui::Spinner::new());
                     }
                     let status = if self.is_scanning {
@@ -3718,29 +3520,39 @@ impl eframe::App for MapManagerApp {
                 catch: self.delete_catch,
                 mania: self.delete_mania,
             };
-            let count = self
-                .scan
-                .as_ref()
-                .map_or(0, |scan| {
-                    scan.maps
-                        .iter()
-                        .filter(|map| selection.matches(map.mode))
-                        .count()
-                });
+            let count = self.scan.as_ref().map_or(0, |scan| {
+                scan.maps
+                    .iter()
+                    .filter(|map| selection.matches(map.mode))
+                    .count()
+            });
             self.delete_confirmation = Some(DeleteIntent::NonStdModes(count));
-        }
-        if load_collections_requested {
-            self.load_collections();
-        }
-        if load_collection_selection_requested {
-            self.load_selected_collection_into_selection();
-        }
-        if save_collection_requested {
-            self.save_selection_to_collection();
         }
 
         self.maybe_show_delete_confirmation(ctx);
     }
+}
+
+/// Rebuilds the selected-hash set after pruning `selected_maps`: kept map
+/// hashes plus any still-selected hashes that have no local map (loaded from
+/// a collection but absent from the scan). The latter cannot be evaluated by
+/// the caller's predicate, so they are preserved rather than silently
+/// dropped.
+fn reconcile_selected_md5s(
+    selected_maps: &[LocalBeatmap],
+    missing_hashes: &[String],
+    selected_md5s: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    selected_maps
+        .iter()
+        .map(|map| map.md5.clone())
+        .chain(
+            missing_hashes
+                .iter()
+                .filter(|hash| selected_md5s.contains(*hash))
+                .cloned(),
+        )
+        .collect()
 }
 
 fn compact_map_details(map: &LocalBeatmap) -> String {
@@ -3831,12 +3643,8 @@ fn load_background_jpeg_fast(path: &Path) -> Result<Option<egui::ColorImage>> {
             .collect(),
         _ => return Ok(None),
     };
-    let decoded = image::RgbImage::from_raw(
-        u32::from(scaled_width),
-        u32::from(scaled_height),
-        rgb,
-    )
-    .with_context(|| format!("decoding {}", path.display()))?;
+    let decoded = image::RgbImage::from_raw(u32::from(scaled_width), u32::from(scaled_height), rgb)
+        .with_context(|| format!("decoding {}", path.display()))?;
     let thumbnail = image::DynamicImage::ImageRgb8(decoded)
         .thumbnail(
             u32::from(BACKGROUND_PREVIEW_WIDTH),
@@ -4034,31 +3842,31 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.code_bg_color = surface;
     style.visuals.hyperlink_color = accent;
     style.visuals.selection.bg_fill = accent_soft;
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, text);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, text);
     style.visuals.warn_fg_color = egui::Color32::from_rgb(0xc4, 0xa2, 0x6a);
     style.visuals.error_fg_color = egui::Color32::from_rgb(0xc2, 0x6b, 0x72);
     style.visuals.window_rounding = egui::Rounding::same(10.0);
     style.visuals.menu_rounding = egui::Rounding::same(8.0);
-    style.visuals.window_stroke = egui::Stroke::new(1.0, border);
+    style.visuals.window_stroke = egui::Stroke::new(1.0_f32, border);
     style.visuals.widgets.noninteractive.bg_fill = surface;
     style.visuals.widgets.noninteractive.weak_bg_fill = surface;
-    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, muted);
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, muted);
     style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
     style.visuals.widgets.inactive.bg_fill = surface;
     style.visuals.widgets.inactive.weak_bg_fill = surface;
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text);
     style.visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
     style.visuals.widgets.hovered.bg_fill = surface_hover;
     style.visuals.widgets.hovered.weak_bg_fill = surface_hover;
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text);
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text);
     style.visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
     style.visuals.widgets.active.bg_fill = accent_soft;
     style.visuals.widgets.active.weak_bg_fill = accent_soft;
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text);
     style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
     ctx.set_style(style);
 }
@@ -4068,7 +3876,7 @@ fn panel_frame(style: &egui::Style) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .fill(egui::Color32::from_rgb(0x18, 0x19, 0x1c))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgb(0x32, 0x33, 0x37),
         ))
 }
@@ -4080,7 +3888,7 @@ fn section_frame(style: &egui::Style) -> egui::Frame {
         .rounding(egui::Rounding::same(10.0))
         .fill(egui::Color32::from_rgb(0x20, 0x21, 0x24))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
         ))
 }
@@ -4092,7 +3900,7 @@ fn inspector_frame(style: &egui::Style) -> egui::Frame {
         .rounding(egui::Rounding::same(8.0))
         .fill(egui::Color32::from_rgb(0x20, 0x21, 0x24))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
         ))
 }
@@ -4103,7 +3911,7 @@ fn nested_frame(style: &egui::Style) -> egui::Frame {
         .rounding(egui::Rounding::same(8.0))
         .fill(egui::Color32::from_rgb(0x26, 0x27, 0x2b))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
         ))
 }
@@ -4452,7 +4260,7 @@ fn run_repair_jobs(
             Ok(outcome) => {
                 let _ = tx.send(RepairEvent::Repaired {
                     beatmapset_id: job.beatmapset_id,
-                    folder_count: job.folders.len(),
+                    folders: job.folders.clone(),
                     restored_files: outcome.restored_files,
                     download_source: outcome.download_source,
                     ignored_after_success: job.ignore_after_success.clone(),
@@ -4474,6 +4282,8 @@ fn run_update_check(
     targets: Vec<updates::CheckTarget>,
     uncheckable: usize,
     backend_url: String,
+    osu_root: String,
+    mut oauth_session: Option<OauthSession>,
     tx: mpsc::Sender<UpdateCheckEvent>,
 ) {
     let total = targets.len();
@@ -4483,20 +4293,52 @@ fn run_update_check(
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
+    // Refresh once up front so the whole check can spend the user's own API
+    // quota instead of the Worker's. On failure the session is dropped and
+    // the Worker serves its app token under the usual rate limits.
+    if oauth_session.is_some()
+        && osu_oauth::ensure_access_token(&client, &backend_url, &mut oauth_session).is_ok()
+        && let Some(session) = &oauth_session
+    {
+        let _ = osu_oauth::save_oauth_session(&osu_root, session);
+    }
+    let access_token = oauth_session
+        .as_ref()
+        .map(|session| session.access_token.clone());
+
     let mut first_request = true;
     for (position, target) in targets.iter().enumerate() {
         let done = position + 1;
         if let Some(set_id) = target.beatmapset_id {
             pace_update_requests(&mut first_request);
-            check_single_set(&client, &backend_url, set_id, &target.locals, &tx);
+            check_single_set(
+                &client,
+                &backend_url,
+                access_token.as_deref(),
+                set_id,
+                &target.locals,
+                &tx,
+            );
         } else {
             // No set id on file: resolve each beatmap id online, then check
             // the discovered sets.
-            match updates::resolve_unknown_sets(&client, &backend_url, &target.locals) {
+            match updates::resolve_unknown_sets(
+                &client,
+                &backend_url,
+                access_token.as_deref(),
+                &target.locals,
+            ) {
                 Ok((grouped, _unresolved)) => {
                     for (set_id, resolved) in grouped {
                         pace_update_requests(&mut first_request);
-                        check_single_set(&client, &backend_url, set_id, &resolved, &tx);
+                        check_single_set(
+                            &client,
+                            &backend_url,
+                            access_token.as_deref(),
+                            set_id,
+                            &resolved,
+                            &tx,
+                        );
                     }
                 }
                 Err(err) => {
@@ -4524,6 +4366,7 @@ fn pace_update_requests(first_request: &mut bool) {
 fn check_single_set(
     client: &reqwest::blocking::Client,
     backend_url: &str,
+    access_token: Option<&str>,
     beatmapset_id: i64,
     locals: &[updates::LocalDiffRef],
     tx: &mpsc::Sender<UpdateCheckEvent>,
@@ -4534,7 +4377,7 @@ fn check_single_set(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    match updates::fetch_set_meta_blocking(client, backend_url, beatmapset_id) {
+    match updates::fetch_set_meta_blocking(client, backend_url, access_token, beatmapset_id) {
         Err(err) => {
             let _ = tx.send(UpdateCheckEvent::Unavailable {
                 beatmapset_id: Some(beatmapset_id),
@@ -4766,7 +4609,8 @@ fn save_repair_ignores(osu_root: &str, store: &RepairIgnoreStore) -> Result<()> 
         fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(store)?;
-    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    collection::write_atomic(&path, text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn repair_ignore_path(osu_root: &str) -> PathBuf {
@@ -4798,7 +4642,8 @@ fn save_scan_cache(osu_root: &str, scan: &LibraryScan) -> Result<()> {
         version: SCAN_CACHE_VERSION,
         scan: scan.clone(),
     })?;
-    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    collection::write_atomic(&path, text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn scan_cache_path(osu_root: &str) -> PathBuf {
@@ -4920,7 +4765,35 @@ mod tests {
     }
 
     #[test]
-    fn repair_restores_only_missing_files_without_clobbering() {        let root = unique_temp_dir("osu-repair-restore");
+    fn selected_missing_hashes_survive_pruning() {
+        let map = |md5: &str| LocalBeatmap {
+            md5: md5.to_owned(),
+            ..Default::default()
+        };
+        // Simulates `retain_selected_maps` keeping only "kept".
+        let retained = vec![map("kept")];
+        let missing = vec![
+            "missing-selected".to_owned(),
+            "missing-unselected".to_owned(),
+        ];
+        let selected: BTreeSet<String> = ["kept", "dropped", "missing-selected"]
+            .iter()
+            .map(|hash| hash.to_string())
+            .collect();
+
+        let reconciled = reconcile_selected_md5s(&retained, &missing, &selected);
+
+        assert!(reconciled.contains("kept"));
+        // Still selected but absent from the scan: preserved.
+        assert!(reconciled.contains("missing-selected"));
+        // Pruned map / never selected: gone.
+        assert!(!reconciled.contains("dropped"));
+        assert!(!reconciled.contains("missing-unselected"));
+    }
+
+    #[test]
+    fn repair_restores_only_missing_files_without_clobbering() {
+        let root = unique_temp_dir("osu-repair-restore");
         let osz = root.join("123.osz");
         write_test_osz(
             &osz,
@@ -4934,8 +4807,7 @@ mod tests {
         fs::create_dir_all(&folder).unwrap();
         fs::write(folder.join("existing.osu"), b"local-osu-bytes").unwrap();
 
-        let restored =
-            restore_missing_from_osz(&osz, &folder, &["audio.mp3".to_owned()]).unwrap();
+        let restored = restore_missing_from_osz(&osz, &folder, &["audio.mp3".to_owned()]).unwrap();
 
         // The requested file plus any other archive entry absent on disk.
         assert_eq!(restored, vec!["audio.mp3".to_owned(), "bg.jpg".to_owned()]);

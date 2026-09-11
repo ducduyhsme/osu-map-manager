@@ -1,0 +1,15 @@
+name = "osu-map-manager"
+main = "src/index.ts"
+compatibility_date = "2026-05-02"
+workers_dev = true
+
+[vars]
+OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
+OSU_API_BASE_URL = "https://osu.ppy.sh/api/v2"
+BEATMAP_MIRROR_DOWNLOAD_BASE_URL = "https://catboy.best/d"
+
+[observability]
+enabled = true
+
+[secrets]
+required = ["OSU_CLIENT_ID", "OSU_CLIENT_SECRET"]

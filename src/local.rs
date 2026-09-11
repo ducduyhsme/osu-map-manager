@@ -12,7 +12,7 @@ use std::{
         mpsc::{self, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -63,6 +63,11 @@ pub struct LibraryScan {
     pub sets: Vec<LocalBeatmapSet>,
     pub maps: Vec<LocalBeatmap>,
     pub problems: Vec<RepairIssue>,
+    /// `(file length, mtime seconds)` per scanned `.osu` path, used to detect
+    /// files modified since the cached scan so they are re-parsed instead of
+    /// trusted blindly.
+    #[serde(default)]
+    pub file_meta: BTreeMap<PathBuf, (u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -72,7 +77,9 @@ pub enum ScanEvent {
         star_parse_error: Option<String>,
     },
     Map {
-        map: LocalBeatmap,
+        map: Box<LocalBeatmap>,
+        file_len: u64,
+        file_mtime_secs: u64,
         issues: Vec<RepairIssue>,
     },
     Problem {
@@ -106,47 +113,6 @@ pub enum RepairSeverity {
 enum ParseIssueKind {
     Timeout,
     ParseError,
-}
-
-#[allow(dead_code)]
-pub fn scan_songs_dir(songs_dir: &Path) -> Result<LibraryScan> {
-    let mut scan = LibraryScan::default();
-    if !songs_dir.exists() {
-        anyhow::bail!("Songs directory does not exist: {}", songs_dir.display());
-    }
-
-    for entry in
-        fs::read_dir(songs_dir).with_context(|| format!("reading {}", songs_dir.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-
-        for osu in fs::read_dir(entry.path())? {
-            let osu = osu?;
-            let path = osu.path();
-            if !is_osu_file(&path) {
-                continue;
-            }
-
-            match parse_osu_file(&path) {
-                Ok(map) => {
-                    scan.problems.extend(find_repair_issues(&map));
-                    scan.maps.push(map);
-                }
-                Err(err) => scan.problems.push(RepairIssue {
-                    beatmap: path,
-                    message: err.to_string(),
-                    severity: RepairSeverity::ParseWarning,
-                }),
-            }
-        }
-    }
-
-    scan.sets = build_sets(&scan.maps);
-
-    Ok(scan)
 }
 
 pub fn scan_songs_dir_streaming(
@@ -223,6 +189,10 @@ fn scan_songs_dir_streaming_inner(
             grouped
         })
         .unwrap_or_default();
+    let cached_meta = cached_scan
+        .as_ref()
+        .map(|scan| scan.file_meta.clone())
+        .unwrap_or_default();
 
     for entry in
         fs::read_dir(songs_dir).with_context(|| format!("reading {}", songs_dir.display()))?
@@ -255,11 +225,21 @@ fn scan_songs_dir_streaming_inner(
                 continue;
             }
 
-            if let Some(map) = cached_maps.get(&path) {
+            // Reuse the cached entry only when the file is byte-identical to
+            // the scan it came from (same length and mtime); anything else
+            // falls through to a fresh parse below.
+            let current_meta = file_meta(&path);
+            if let Some(map) = cached_maps.get(&path)
+                && cached_entry_fresh(cached_meta.get(&path), current_meta.as_ref())
+            {
                 let issues = cached_problems.get(&path).cloned().unwrap_or_default();
+                let (file_len, file_mtime_secs) =
+                    current_meta.expect("freshness implies metadata was read");
                 maps.push(map.clone());
                 let _ = tx.send(ScanEvent::Map {
-                    map: map.clone(),
+                    map: Box::new(map.clone()),
+                    file_len,
+                    file_mtime_secs,
                     issues,
                 });
                 continue;
@@ -272,14 +252,12 @@ fn scan_songs_dir_streaming_inner(
                 calculate_local_stars,
             ) {
                 Ok(mut map) => {
-                    if let Some(index) = &db_index {
-                        if map.stars.is_none()
-                            && let Some(file_name) =
-                                map.path.file_name().and_then(|file| file.to_str())
-                            && let Some(meta) = index.get(&map.md5, file_name)
-                        {
-                            map.stars = meta.standard_stars;
-                        }
+                    if let Some(index) = &db_index
+                        && map.stars.is_none()
+                        && let Some(file_name) = map.path.file_name().and_then(|file| file.to_str())
+                        && let Some(meta) = index.get(&map.md5, file_name)
+                    {
+                        map.stars = meta.standard_stars;
                     }
                     if map.stars.is_none() && map.mode.unwrap_or(0) == 0 {
                         map.stars = calculate_stars_for_path_with_timeout(
@@ -290,8 +268,18 @@ fn scan_songs_dir_streaming_inner(
                         .flatten();
                     }
                     let issues = find_repair_issues(&map);
+                    // Re-stat after parsing: the file could theoretically have
+                    // changed mid-parse, in which case the next scan picks up
+                    // the newer metadata instead of trusting this entry.
+                    let (file_len, file_mtime_secs) =
+                        current_meta.or_else(|| file_meta(&path)).unwrap_or((0, 0));
                     maps.push(map.clone());
-                    let _ = tx.send(ScanEvent::Map { map, issues });
+                    let _ = tx.send(ScanEvent::Map {
+                        map: Box::new(map),
+                        file_len,
+                        file_mtime_secs,
+                        issues,
+                    });
                 }
                 Err((kind, err)) => {
                     let issue_kind = kind.as_str();
@@ -380,6 +368,7 @@ fn parse_osu_file_with_timeout(
     }
 }
 
+#[allow(dead_code)]
 pub fn parse_osu_file(path: &Path) -> Result<LocalBeatmap> {
     parse_osu_file_inner(path, true)
 }
@@ -415,20 +404,25 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
             bpm = parse_timing_point_bpm(line);
         }
 
-        if section == "HitObjects" {
-            if let Some((time, object_type)) = parse_hit_object(line) {
-                last_object_time =
-                    Some(last_object_time.map_or(time, |current: i32| current.max(time)));
-                if object_type & 1 != 0 {
-                    circles += 1;
-                }
-                if object_type & 2 != 0 {
-                    sliders += 1;
-                }
+        if section == "HitObjects"
+            && let Some((time, object_type)) = parse_hit_object(line)
+        {
+            last_object_time =
+                Some(last_object_time.map_or(time, |current: i32| current.max(time)));
+            if object_type & 1 != 0 {
+                circles += 1;
+            }
+            if object_type & 2 != 0 {
+                sliders += 1;
             }
         }
 
-        if let Some((key, value)) = line.split_once(':') {
+        // Only sections carrying `Key: Value` metadata populate the table.
+        // HitObjects/Events/TimingPoints lines contain colons too (hit-sample
+        // `0:0:0:0` extras), which must not become phantom metadata keys.
+        if matches!(section, "General" | "Metadata" | "Difficulty")
+            && let Some((key, value)) = line.split_once(':')
+        {
             values.insert(key.trim().to_owned(), value.trim().to_owned());
         }
     }
@@ -597,14 +591,12 @@ fn parse_folder_set_id(folder: &Path) -> Option<i64> {
 /// trailing comments or whitespace cannot silently drop the mode. A missing
 /// `Mode` field means osu!std and stays `None`.
 fn parse_mode(values: &BTreeMap<String, String>) -> Option<u8> {
-    let value = values
-        .get("Mode")
-        .or_else(|| {
-            values
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("mode"))
-                .map(|(_, value)| value)
-        })?;
+    let value = values.get("Mode").or_else(|| {
+        values
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("mode"))
+            .map(|(_, value)| value)
+    })?;
     let digits: String = value
         .trim()
         .chars()
@@ -622,6 +614,29 @@ pub fn is_osu_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("osu"))
+}
+
+/// `(file length, mtime seconds)` for a path, or `None` when the file cannot
+/// be statted. Used to validate cached scan entries.
+fn file_meta(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((meta.len(), mtime))
+}
+
+/// Whether a cached scan entry may be reused: only when both sides recorded
+/// metadata and it matches. A missing cache entry (old cache version or a
+/// file never scanned) always forces a fresh parse.
+fn cached_entry_fresh(cached: Option<&(u64, u64)>, current: Option<&(u64, u64)>) -> bool {
+    match (cached, current) {
+        (Some(cached), Some(current)) => cached == current,
+        _ => false,
+    }
 }
 
 /// Counts beatmap files under `songs_dir` (one level of set folders) so scan
@@ -697,6 +712,18 @@ ApproachRate:9
         assert!(issues.is_empty());
 
         let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn cached_entries_are_reused_only_when_file_meta_matches() {
+        assert!(cached_entry_fresh(Some(&(10, 100)), Some(&(10, 100))));
+        // Changed size or mtime: re-parse.
+        assert!(!cached_entry_fresh(Some(&(10, 100)), Some(&(11, 100))));
+        assert!(!cached_entry_fresh(Some(&(10, 100)), Some(&(10, 101))));
+        // Old caches have no metadata at all: never trust blindly.
+        assert!(!cached_entry_fresh(None, Some(&(10, 100))));
+        assert!(!cached_entry_fresh(Some(&(10, 100)), None));
+        assert!(!cached_entry_fresh(None, None));
     }
 
     #[test]
