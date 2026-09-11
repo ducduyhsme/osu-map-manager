@@ -4526,6 +4526,8 @@ fn restore_missing_from_osz(
 
     fs::create_dir_all(folder)?;
     let mut restored = Vec::new();
+    let mut restored_files = 0_usize;
+    let mut restored_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         if entry.is_dir() {
@@ -4556,7 +4558,9 @@ fn restore_missing_from_osz(
             continue;
         }
         let mut output = fs::File::create(&output_path)?;
-        io::copy(&mut entry, &mut output)?;
+        restored_bytes += io::copy(&mut entry, &mut output)?;
+        restored_files += 1;
+        updates::check_extract_budget(restored_files, restored_bytes, folder)?;
         restored.push(file_name.to_owned());
     }
     restored.sort();

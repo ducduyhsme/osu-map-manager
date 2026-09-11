@@ -17,10 +17,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
-
 /// Remote beatmap entry inside a beatmapset response. Fields mirror the osu!
 /// API; not every field is consumed locally.
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +313,33 @@ pub fn fetch_beatmap_blocking(
         .map(Some)
 }
 
+/// Upper bound for a downloaded `.osz`: generous for video maps, but a
+/// mirror streaming forever must not fill the disk.
+pub const MAX_OSZ_DOWNLOAD_BYTES: u64 = 1_073_741_824; // 1 GiB
+
+/// Extraction guardrails: a corrupt or hostile archive must fail fast
+/// instead of filling the disk.
+pub const MAX_EXTRACT_FILES: usize = 10_000;
+pub const MAX_EXTRACT_BYTES: u64 = 2_147_483_648; // 2 GiB total per folder
+
+/// Enforces the extraction guardrails against actually-written bytes (not
+/// declared archive sizes, which a hostile archive can lie about).
+pub fn check_extract_budget(file_count: usize, total_bytes: u64, folder: &Path) -> Result<()> {
+    if file_count > MAX_EXTRACT_FILES {
+        anyhow::bail!(
+            "archive for {} lists too many files; refusing to extract",
+            folder.display()
+        );
+    }
+    if total_bytes > MAX_EXTRACT_BYTES {
+        anyhow::bail!(
+            "archive for {} is too large to extract safely",
+            folder.display()
+        );
+    }
+    Ok(())
+}
+
 /// Downloads a beatmapset `.osz` through the Worker. Sends the osu! OAuth
 /// token when signed in so the Worker can use the official osu! API; without
 /// a token the Worker serves the mirror. Returns the download source reported
@@ -345,9 +372,14 @@ pub fn download_beatmapset_file(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("mirror")
         .to_owned();
-    let mut response = response;
     let mut file = fs::File::create(destination)?;
-    io::copy(&mut response, &mut file)?;
+    // Read one byte past the cap so an over-long stream is detected instead
+    // of being silently truncated into a corrupt archive.
+    let mut limited = response.take(MAX_OSZ_DOWNLOAD_BYTES + 1);
+    let copied = io::copy(&mut limited, &mut file)?;
+    if copied > MAX_OSZ_DOWNLOAD_BYTES {
+        anyhow::bail!("download for set {beatmapset_id} exceeds 1 GiB; refusing to keep it");
+    }
     Ok(download_source)
 }
 
@@ -470,6 +502,8 @@ fn extract_full_into_folder(osz_path: &Path, folder: &Path) -> Result<FullExtrac
     fs::create_dir_all(folder)?;
     let mut written = Vec::new();
     let mut archived_osu_names = BTreeSet::new();
+    let mut extracted_files = 0_usize;
+    let mut extracted_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         if entry.is_dir() {
@@ -483,7 +517,9 @@ fn extract_full_into_folder(osz_path: &Path, folder: &Path) -> Result<FullExtrac
             fs::create_dir_all(parent)?;
         }
         let mut output = fs::File::create(&output_path)?;
-        io::copy(&mut entry, &mut output)?;
+        extracted_bytes += io::copy(&mut entry, &mut output)?;
+        extracted_files += 1;
+        check_extract_budget(extracted_files, extracted_bytes, folder)?;
         if let Some(file_name) = enclosed_name.file_name().and_then(|name| name.to_str()) {
             written.push(file_name.to_owned());
             if enclosed_name
@@ -735,5 +771,50 @@ mod tests {
         let bytes = b"[Metadata]\nBeatmapID: 456\nBeatmapSetID: 123\n";
         assert_eq!(read_beatmap_id(bytes), Some(456));
         assert_eq!(read_beatmap_id(b"[Metadata]\nTitle:X\n"), None);
+    }
+
+    #[test]
+    fn extraction_budget_allows_normal_archives() {
+        let folder = Path::new("song");
+        assert!(check_extract_budget(3, 1024, folder).is_ok());
+        assert!(check_extract_budget(MAX_EXTRACT_FILES, MAX_EXTRACT_BYTES, folder).is_ok());
+        assert!(check_extract_budget(MAX_EXTRACT_FILES + 1, 0, folder).is_err());
+        assert!(check_extract_budget(0, MAX_EXTRACT_BYTES + 1, folder).is_err());
+    }
+
+    #[test]
+    fn extraction_refuses_absurd_file_counts() {
+        let root = std::env::temp_dir().join(format!(
+            "osu-update-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let osz = root.join("many.osz");
+        {
+            let file = fs::File::create(&osz).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for index in 0..=MAX_EXTRACT_FILES {
+                writer
+                    .start_file(
+                        format!("f{index}.bin"),
+                        zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored),
+                    )
+                    .unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let folder = root.join("song");
+        fs::create_dir_all(&folder).unwrap();
+        assert!(extract_full_into_folder(&osz, &folder).is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

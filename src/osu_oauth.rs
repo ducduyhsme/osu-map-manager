@@ -266,18 +266,75 @@ pub fn exchange_code_blocking(
     token_session_from_response(response, "sign-in")
 }
 
+/// A failed refresh, classified so callers know whether the stored grant is
+/// dead or the failure was transient.
+#[derive(Debug)]
+pub struct RefreshError {
+    /// True only for `invalid_grant`: the refresh token itself was rejected
+    /// and signing in again is the only fix. Network failures, worker
+    /// misconfiguration, and osu! outages are transient — the stored session
+    /// must be kept so the next attempt can succeed without re-login.
+    pub permanent: bool,
+    pub err: anyhow::Error,
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.err)
+    }
+}
+
+impl std::error::Error for RefreshError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.err.as_ref())
+    }
+}
+
 pub fn refresh_blocking(
     client: &reqwest::blocking::Client,
     backend_url: &str,
     refresh_token: &str,
-) -> Result<OauthSession> {
+) -> std::result::Result<OauthSession, RefreshError> {
     let backend = backend_base_url(backend_url);
     let response = client
         .post(format!("{backend}/oauth/refresh"))
         .form(&[("refresh_token", refresh_token)])
         .send()
-        .context("refreshing the osu! access token")?;
-    token_session_from_response(response, "token refresh")
+        .context("refreshing the osu! access token")
+        .map_err(|err| RefreshError {
+            permanent: false,
+            err,
+        })?;
+    if response.status().is_success() {
+        return response
+            .json::<TokenResponse>()
+            .context("decoding the osu! token response")
+            .and_then(TokenResponse::into_session)
+            .map_err(|err| RefreshError {
+                permanent: false,
+                err,
+            });
+    }
+    let body = response.text().unwrap_or_default();
+    Err(RefreshError {
+        permanent: is_invalid_grant(&body),
+        err: anyhow::anyhow!("{}", friendly_token_error(&body, "token refresh")),
+    })
+}
+
+/// True when an osu! error body reports `invalid_grant` (revoked/expired
+/// refresh token). Any other failure — including other OAuth error codes —
+/// is treated as transient: only a dead grant discards the stored session.
+fn is_invalid_grant(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("error")?
+                .as_str()
+                .map(|error| error == "invalid_grant")
+        })
+        .unwrap_or(false)
 }
 
 /// Turns a proxied osu! token response into a session, translating osu!'s
@@ -349,10 +406,11 @@ pub fn ensure_access_token(
             *session = Some(next);
             Ok(Some(token))
         }
-        Err(err) => {
+        Err(failure) if failure.permanent => {
             *session = None;
-            Err(err)
+            Err(failure.err)
         }
+        Err(failure) => Err(failure.err),
     }
 }
 
@@ -540,7 +598,29 @@ pub fn save_oauth_session(osu_root: &str, session: &OauthSession) -> Result<()> 
     }
     let text = serde_json::to_string_pretty(session)?;
     crate::collection::write_atomic(&path, text.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
+        .with_context(|| format!("writing {}", path.display()))?;
+    restrict_token_permissions(&path)
+}
+
+/// Refresh/access tokens are bearer credentials: limit the file to the owner
+/// where the platform allows it. (Windows has no Unix mode bits; the file
+/// already lives in the user's own osu! directory.)
+fn restrict_token_permissions(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("reading permissions of {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("restricting permissions of {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 pub fn clear_oauth_session(osu_root: &str) {
@@ -625,6 +705,20 @@ mod tests {
 
         let html = friendly_token_error("<html>oops</html>", "sign-in");
         assert!(html.contains("oops"));
+    }
+
+    #[test]
+    fn only_invalid_grant_is_a_permanent_refresh_failure() {
+        assert!(is_invalid_grant(
+            r#"{"error":"invalid_grant","error_description":"The refresh token is invalid."}"#
+        ));
+        // Other OAuth errors (e.g. broken Worker secrets) and non-JSON
+        // bodies are transient: the stored session must survive them.
+        assert!(!is_invalid_grant(
+            r#"{"error":"invalid_client","error_description":"Client authentication failed"}"#
+        ));
+        assert!(!is_invalid_grant("<html>bad gateway</html>"));
+        assert!(!is_invalid_grant(""));
     }
 
     #[test]

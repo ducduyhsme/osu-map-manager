@@ -148,6 +148,10 @@ fn read_star_rating_pairs(reader: &mut DbReader<'_>) -> Result<Option<f32>> {
     Ok(no_mod)
 }
 
+/// Sanity cap for a single osu!.db string: names and paths are bytes to
+/// kilobytes in practice; anything larger is corruption, not content.
+const MAX_OSU_DB_STRING_LEN: u64 = 1_000_000;
+
 struct DbReader<'a> {
     cursor: Cursor<&'a [u8]>,
 }
@@ -206,9 +210,16 @@ impl<'a> DbReader<'a> {
             anyhow::bail!("invalid osu!.db string marker {marker}");
         }
 
-        let len = self.uleb128()? as usize;
-        let mut buf = vec![0; len];
+        let len = self.uleb128()?;
+        // A corrupt length prefix must not cause a gigantic allocation.
+        if len > MAX_OSU_DB_STRING_LEN {
+            anyhow::bail!("osu!.db string length {len} exceeds sanity limit");
+        }
+        let mut buf = vec![0; len as usize];
         self.cursor.read_exact(&mut buf)?;
+        // Lossy on purpose: real libraries contain non-UTF-8 artist/title
+        // bytes (legacy encodings), and dropping the whole osu!.db over one
+        // bad name would be worse than a replacement character.
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
@@ -222,6 +233,35 @@ impl<'a> DbReader<'a> {
                 return Ok(value);
             }
             shift += 7;
+            if shift >= 64 {
+                anyhow::bail!("uleb128 value is too large");
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlong_uleb128_is_rejected() {
+        // 11 continuation bytes: no u64 can be that long.
+        let bytes = vec![0x80; 11];
+        assert!(DbReader::new(&bytes).uleb128().is_err());
+        // Largest valid encoding still decodes.
+        let max = vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert_eq!(DbReader::new(&max).uleb128().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn absurd_string_length_is_rejected_without_allocating() {
+        // 0x0b marker + uleb128(u64::MAX): must bail before any big read.
+        let bytes = vec![
+            0x0b, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+        ];
+        assert!(DbReader::new(&bytes).string().is_err());
+        // Empty and tiny strings still work.
+        assert_eq!(DbReader::new(&[0]).string().unwrap(), "");
     }
 }
