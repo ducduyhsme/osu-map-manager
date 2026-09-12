@@ -430,7 +430,7 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
     let mut section = "";
     let mut values = BTreeMap::<String, String>::new();
     let mut background_filename = None;
-    let mut bpm = None;
+    let mut timing_points = Vec::<(i32, f32)>::new();
     let mut last_object_time = None;
     let mut circles = 0;
     let mut sliders = 0;
@@ -449,8 +449,10 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
             background_filename = parse_event_filename(line);
         }
 
-        if section == "TimingPoints" && bpm.is_none() {
-            bpm = parse_timing_point_bpm(line);
+        if section == "TimingPoints"
+            && let Some(point) = parse_timing_point(line)
+        {
+            timing_points.push(point);
         }
 
         if section == "HitObjects"
@@ -482,6 +484,7 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
     let stars = calculate_local_stars
         .then(|| calculate_stars(&bytes))
         .flatten();
+    let bpm = main_bpm(&timing_points, last_object_time);
 
     Ok(LocalBeatmap {
         path: path.to_owned(),
@@ -610,11 +613,36 @@ fn is_repairable_asset_filename(value: &str) -> bool {
     )
 }
 
-fn parse_timing_point_bpm(line: &str) -> Option<f32> {
+/// Parses a timing point into `(offset_ms, beat_length_ms)`. Only uninherited
+/// (red) lines carry a tempo (`beat_length > 0`); inherited (green) lines
+/// carry slider velocity instead and are skipped.
+fn parse_timing_point(line: &str) -> Option<(i32, f32)> {
     let mut fields = line.split(',');
-    let _offset = fields.next()?;
+    let offset = fields.next()?.parse::<i32>().ok()?;
     let beat_length = fields.next()?.parse::<f32>().ok()?;
-    (beat_length > 0.0).then_some(60_000.0 / beat_length)
+    (beat_length > 0.0).then_some((offset, beat_length))
+}
+
+/// The map's main tempo: the red line active for the longest stretch of the
+/// song. Single-BPM maps trivially resolve to their only red line, matching
+/// the old first-point behavior; multi-BPM maps now resolve to the dominant
+/// tempo instead of whichever came first.
+fn main_bpm(points: &[(i32, f32)], song_end_ms: Option<i32>) -> Option<f32> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut sorted = points.to_vec();
+    sorted.sort_by_key(|&(offset, _)| offset);
+    let end = song_end_ms.unwrap_or_else(|| sorted.last().map(|&(offset, _)| offset).unwrap_or(0));
+    let mut best: Option<(i32, f32)> = None;
+    for (index, &(offset, beat_length)) in sorted.iter().enumerate() {
+        let active_until = sorted.get(index + 1).map(|&(next, _)| next).unwrap_or(end);
+        let active_ms = (active_until - offset).max(0);
+        if best.is_none_or(|(best_ms, _)| active_ms > best_ms) {
+            best = Some((active_ms, beat_length));
+        }
+    }
+    best.map(|(_, beat_length)| 60_000.0 / beat_length)
 }
 
 fn parse_hit_object(line: &str) -> Option<(i32, i32)> {
@@ -764,6 +792,23 @@ ApproachRate:9
         assert!(issues.is_empty());
 
         let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn main_bpm_prefers_the_longest_active_red_line() {
+        // Intro at 120 BPM for 10s, then 200 BPM for 100s.
+        let points = vec![(0, 500.0), (10_000, 300.0)];
+        assert_eq!(main_bpm(&points, Some(110_000)), Some(200.0));
+        // Order in the file does not matter.
+        let shuffled = vec![(10_000, 300.0), (0, 500.0)];
+        assert_eq!(main_bpm(&shuffled, Some(110_000)), Some(200.0));
+        // Single red line behaves like the old first-point logic.
+        assert_eq!(main_bpm(&[(500, 400.0)], Some(90_000)), Some(150.0));
+        // No red lines, no tempo.
+        assert_eq!(main_bpm(&[], Some(90_000)), None);
+        // Unknown song end falls back to the last point's offset, so the
+        // trailing red line measures zero active time here.
+        assert_eq!(main_bpm(&points, None), Some(120.0));
     }
 
     #[test]

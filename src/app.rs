@@ -41,6 +41,10 @@ const BACKGROUND_MAX_IN_FLIGHT: usize = 4;
 /// Delay between update-check metadata requests so a big library does not
 /// hammer the osu! API through the Worker.
 const UPDATE_CHECK_DELAY: Duration = Duration::from_millis(300);
+/// Slower pacing for unsigned checks: those spend the Worker's shared app
+/// quota, which osu! asks clients to keep under 60 req/min (~1 req/s).
+/// Signed-in checks spend the user's own quota instead.
+const UPDATE_CHECK_DELAY_ANONYMOUS: Duration = Duration::from_millis(1100);
 
 pub struct MapManagerApp {
     active_tab: AppTab,
@@ -112,6 +116,7 @@ pub struct MapManagerApp {
     background_in_flight: HashSet<PathBuf>,
     background_cache: HashMap<PathBuf, egui::TextureHandle>,
     background_cache_order: Vec<PathBuf>,
+    audio_backend: Option<AudioBackend>,
     audio_player: Option<AudioPlayer>,
     audio_volume: f32,
     status: String,
@@ -155,8 +160,15 @@ impl AppTab {
     }
 }
 
-struct AudioPlayer {
+/// Long-lived audio output device, opened once and shared by every preview.
+/// Reopening the default device per track is slow and can fail on devices
+/// that allow only one open handle.
+struct AudioBackend {
     _stream: rodio::OutputStream,
+    handle: rodio::OutputStreamHandle,
+}
+
+struct AudioPlayer {
     sink: rodio::Sink,
     path: PathBuf,
 }
@@ -167,16 +179,13 @@ struct FfmpegPcmSource {
 }
 
 impl AudioPlayer {
-    fn start(path: &Path, volume: f32) -> Result<Self> {
-        let (stream, stream_handle) = rodio::OutputStream::try_default()
-            .context("opening the default audio output device")?;
-        let sink = rodio::Sink::try_new(&stream_handle).context("creating the audio player")?;
+    fn start(stream_handle: &rodio::OutputStreamHandle, path: &Path, volume: f32) -> Result<Self> {
+        let sink = rodio::Sink::try_new(stream_handle).context("creating the audio player")?;
         let source = FfmpegPcmSource::spawn(path)?;
         sink.set_volume(volume);
         sink.append(source);
         sink.play();
         Ok(Self {
-            _stream: stream,
             sink,
             path: path.to_owned(),
         })
@@ -493,6 +502,7 @@ impl MapManagerApp {
             background_in_flight: HashSet::new(),
             background_cache: HashMap::new(),
             background_cache_order: Vec::new(),
+            audio_backend: None,
             audio_player: None,
             audio_volume: 0.8,
             status: cached_status.unwrap_or_else(|| "Ready".to_owned()),
@@ -2624,14 +2634,45 @@ impl MapManagerApp {
         self.background_preview_error = None;
     }
 
+    /// Opens the shared output device on first use and reuses it afterwards.
+    fn audio_handle(&mut self) -> Result<rodio::OutputStreamHandle> {
+        if self.audio_backend.is_none() {
+            let (stream, handle) = rodio::OutputStream::try_default()
+                .context("opening the default audio output device")?;
+            self.audio_backend = Some(AudioBackend {
+                _stream: stream,
+                handle,
+            });
+        }
+        Ok(self
+            .audio_backend
+            .as_ref()
+            .expect("backend was just created")
+            .handle
+            .clone())
+    }
+
     fn start_audio_playback(&mut self, path: &Path) {
         self.audio_player = None;
-        match AudioPlayer::start(path, self.audio_volume) {
+        let handle = match self.audio_handle() {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.status = format!("Audio playback failed: {err:#}");
+                return;
+            }
+        };
+        match AudioPlayer::start(&handle, path, self.audio_volume) {
             Ok(player) => {
                 self.status = format!("Playing audio in app: {}", path.display());
                 self.audio_player = Some(player);
             }
-            Err(err) => self.status = format!("Audio playback failed: {err:#}"),
+            Err(err) => {
+                // The device may have disappeared (unplugged/default changed):
+                // drop the backend so the next attempt reopens it instead of
+                // failing against a dead handle forever.
+                self.audio_backend = None;
+                self.status = format!("Audio playback failed: {err:#}");
+            }
         }
     }
 
@@ -3373,6 +3414,12 @@ impl eframe::App for MapManagerApp {
                                                                         set.outdated_count(),
                                                                         set.total_checked()
                                                                     );
+                                                                    if !set.status.is_empty() {
+                                                                        header.push_str(&format!(
+                                                                            " · {}",
+                                                                            set.status
+                                                                        ));
+                                                                    }
                                                                     if let Some(updated) =
                                                                         &set.remote_updated
                                                                     {
@@ -4372,12 +4419,19 @@ fn run_update_check(
     let access_token = oauth_session
         .as_ref()
         .map(|session| session.access_token.clone());
+    // Anonymous checks spend the shared app quota: stay inside osu!'s
+    // documented 60 req/min. Signed-in checks spend the user's own quota.
+    let request_delay = if access_token.is_some() {
+        UPDATE_CHECK_DELAY
+    } else {
+        UPDATE_CHECK_DELAY_ANONYMOUS
+    };
 
     let mut first_request = true;
     for (position, target) in targets.iter().enumerate() {
         let done = position + 1;
         if let Some(set_id) = target.beatmapset_id {
-            pace_update_requests(&mut first_request);
+            pace_update_requests(&mut first_request, request_delay);
             check_single_set(
                 &client,
                 &backend_url,
@@ -4397,7 +4451,7 @@ fn run_update_check(
             ) {
                 Ok((grouped, _unresolved)) => {
                     for (set_id, resolved) in grouped {
-                        pace_update_requests(&mut first_request);
+                        pace_update_requests(&mut first_request, request_delay);
                         check_single_set(
                             &client,
                             &backend_url,
@@ -4422,11 +4476,11 @@ fn run_update_check(
     let _ = tx.send(UpdateCheckEvent::Finished);
 }
 
-fn pace_update_requests(first_request: &mut bool) {
+fn pace_update_requests(first_request: &mut bool, delay: Duration) {
     if *first_request {
         *first_request = false;
     } else {
-        thread::sleep(UPDATE_CHECK_DELAY);
+        thread::sleep(delay);
     }
 }
 

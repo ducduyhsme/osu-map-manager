@@ -130,7 +130,8 @@ does the same comparison in bulk:
 
 1. Click `Check for updates`. The app compares every installed difficulty that has an online
    beatmap id against the current osu!web checksums (the same signal osu! uses). Checking works
-   without sign-in.
+   without sign-in, but is paced slower then to respect osu!'s rate limits; signing in spends
+   your own quota instead of the shared one and checks faster.
 2. Review the outdated sets — each lists which difficulties changed and the online version date.
 3. Click `Update all` or update a single set. The app redownloads the beatmapset (official osu!
    API when signed in, mirror otherwise), overwrites it with the latest files, removes

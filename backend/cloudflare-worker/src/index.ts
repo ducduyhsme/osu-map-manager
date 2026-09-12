@@ -19,7 +19,7 @@ type OAuthSecrets = {
 let cachedToken: CachedToken | undefined;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // No CORS headers on purpose: the only client is the desktop app
     // (non-browser, unaffected by CORS), so cross-origin browser access is
     // denied by default instead of letting any website drive the Worker.
@@ -55,12 +55,12 @@ export default {
 
     const beatmapsetMatch = url.pathname.match(/^\/beatmapsets\/(\d+)$/);
     if (request.method === "GET" && beatmapsetMatch) {
-      return getBeatmapset(Number(beatmapsetMatch[1]), env, request);
+      return getBeatmapset(Number(beatmapsetMatch[1]), env, request, ctx);
     }
 
     const beatmapMatch = url.pathname.match(/^\/beatmaps\/(\d+)$/);
     if (request.method === "GET" && beatmapMatch) {
-      return getBeatmap(Number(beatmapMatch[1]), env, request);
+      return getBeatmap(Number(beatmapMatch[1]), env, request, ctx);
     }
 
     return json({ error: "not_found" }, 404);
@@ -308,13 +308,50 @@ async function osuApiGet(path: string, env: Env, request: Request): Promise<Resp
   });
 }
 
-async function getBeatmapset(beatmapsetId: number, env: Env, request: Request): Promise<Response> {
+/// Public osu! metadata is identical regardless of whose token fetched it,
+/// so successful responses are cached by URL across all callers for a few
+/// minutes. Repeat and burst checks are absorbed here before they reach
+/// osu!, keeping the shared app quota far under the documented 60 req/min.
+/// (A few minutes of staleness is harmless for weekly update checks.)
+const METADATA_CACHE_TTL_SECONDS = 300;
+
+async function cachedOsuApiGet(
+  path: string,
+  env: Env,
+  request: Request,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const cacheKey = new Request(`${env.OSU_API_BASE_URL}${path}`, { method: "GET" });
+  let cache: Cache | undefined;
+  try {
+    cache = await caches.open("osu-metadata");
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      return cached;
+    }
+  } catch {
+    // Cache unavailable: fall through to upstream.
+  }
+
+  const upstream = await osuApiGet(path, env, request);
+  if (upstream.ok && cache) {
+    const copy = upstream.clone();
+    const headers = new Headers(copy.headers);
+    headers.set("Cache-Control", `public, max-age=${METADATA_CACHE_TTL_SECONDS}`);
+    ctx.waitUntil(
+      cache.put(cacheKey, new Response(copy.body, { status: copy.status, headers }))
+    );
+  }
+  return upstream;
+}
+
+async function getBeatmapset(beatmapsetId: number, env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
   if (!Number.isSafeInteger(beatmapsetId) || beatmapsetId <= 0) {
     return json({ error: "invalid_beatmapset_id" }, 400);
   }
 
   try {
-    const upstream = await osuApiGet(`/beatmapsets/${beatmapsetId}`, env, request);
+    const upstream = await cachedOsuApiGet(`/beatmapsets/${beatmapsetId}`, env, request, ctx);
 
     if (!upstream.ok) {
       const body = await safeText(upstream);
@@ -327,13 +364,13 @@ async function getBeatmapset(beatmapsetId: number, env: Env, request: Request): 
   }
 }
 
-async function getBeatmap(beatmapId: number, env: Env, request: Request): Promise<Response> {
+async function getBeatmap(beatmapId: number, env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
   if (!Number.isSafeInteger(beatmapId) || beatmapId <= 0) {
     return json({ error: "invalid_beatmap_id" }, 400);
   }
 
   try {
-    const upstream = await osuApiGet(`/beatmaps/${beatmapId}`, env, request);
+    const upstream = await cachedOsuApiGet(`/beatmaps/${beatmapId}`, env, request, ctx);
 
     if (upstream.status === 404) {
       return json({ error: "beatmap_not_found" }, 404);

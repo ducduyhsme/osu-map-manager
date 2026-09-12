@@ -106,3 +106,16 @@ For public distribution, add Cloudflare rate limiting or WAF rules on:
 
 The Worker also caches the osu! access token in memory until close to expiry to avoid
 requesting a new token per download.
+
+## Rate posture
+
+osu! asks API clients to stay under 60 requests/minute per token. The design
+respects that on three levels:
+
+- Successful metadata responses (`GET /beatmapsets/:id`, `GET /beatmaps/:id`)
+  are cached by URL for 5 minutes across all callers — the bodies are public
+  and identical regardless of whose token fetched them.
+- When the desktop app is signed in, metadata and downloads spend the *user's*
+  own quota; the shared app quota is only spent by unsigned callers (who the
+  app additionally paces to ~1 req/s).
+- Nothing retries: a failed check or download is reported once, never looped.

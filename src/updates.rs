@@ -46,6 +46,10 @@ pub struct RemoteSetMeta {
     pub title: String,
     #[serde(default)]
     pub creator: String,
+    /// Ranking status reported by osu! (`ranked`, `loved`, `qualified`,
+    /// `pending`, `wip`, `graveyard`). Empty when the API omits it.
+    #[serde(default)]
+    pub status: String,
     #[serde(default)]
     pub last_updated: Option<String>,
     #[serde(default)]
@@ -97,6 +101,8 @@ pub struct OutdatedDiff {
 pub struct OutdatedSet {
     pub beatmapset_id: i64,
     pub title: String,
+    /// Online ranking status at check time (`RemoteSetMeta::status`).
+    pub status: String,
     pub remote_updated: Option<String>,
     pub outdated: Vec<OutdatedDiff>,
     pub up_to_date: usize,
@@ -163,6 +169,7 @@ pub fn detect_outdated(
     OutdatedSet {
         beatmapset_id,
         title,
+        status: remote.status.clone(),
         remote_updated,
         outdated,
         up_to_date,
@@ -653,6 +660,7 @@ mod tests {
             "artist": "Artist",
             "title": "Title",
             "creator": "Mapper",
+            "status": "ranked",
             "last_updated": "2026-01-01T00:00:00+00:00",
             "beatmaps": [
                 {"id": 1, "version": "Normal", "checksum": "aaa"},
@@ -697,6 +705,7 @@ mod tests {
         // Insane has no online checksum to confirm against, so it stays
         // unchecked rather than looping forever.
         assert_eq!(set.outdated_count(), 2);
+        assert_eq!(set.status, "ranked");
         assert!(
             set.outdated
                 .iter()
@@ -711,6 +720,7 @@ mod tests {
             artist: String::new(),
             title: String::new(),
             creator: String::new(),
+            status: String::new(),
             last_updated: None,
             beatmaps: vec![RemoteBeatmap {
                 id: 1,
