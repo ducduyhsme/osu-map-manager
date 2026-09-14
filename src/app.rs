@@ -133,6 +133,42 @@ enum DeleteIntent {
     Collection(String),
     NonStdModes(usize),
     RestoreBackup,
+    SaveCollection {
+        name: String,
+        maps: usize,
+        hashes: usize,
+        exists: bool,
+    },
+}
+
+/// What the automatic backup holds: when it was written and how many
+/// collections/maps it contains. Shown next to the undo button and inside
+/// its confirmation so the restore point is obvious.
+struct BackupInfo {
+    when: String,
+    collections: usize,
+    maps: usize,
+}
+
+fn collection_backup_info(db_path: Option<PathBuf>) -> Option<BackupInfo> {
+    let backup = db_path?.with_extension("db.bak");
+    let modified = fs::metadata(&backup).ok()?.modified().ok()?;
+    let when = chrono::DateTime::<chrono::Local>::from(modified)
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+    let (collections, maps) = collection::load_collection_db(&backup)
+        .map(|db| {
+            (
+                db.collections.len(),
+                db.collections.iter().map(|c| c.hashes.len()).sum(),
+            )
+        })
+        .unwrap_or((0, 0));
+    Some(BackupInfo {
+        when,
+        collections,
+        maps,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2280,15 +2316,22 @@ impl MapManagerApp {
 
                     ui.add_space(4.0);
                     ui.separator();
-                    // Save workflow: one name field, two clear actions.
+                    // Save workflow: full-width name field, actions below it.
                     ui.label(egui::RichText::new("Save selection").strong());
-                    ui.horizontal(|ui| {
+                    // The app theme forces full-brightness text everywhere,
+                    // which also makes hint text indistinguishable from real
+                    // input — clear the override for this field so the
+                    // placeholder renders faded as users expect.
+                    ui.scope(|ui| {
+                        ui.visuals_mut().override_text_color = None;
                         ui.add_sized(
-                            [ui.available_width().min(300.0) - 210.0, 28.0],
+                            [ui.available_width().max(80.0), 28.0],
                             egui::TextEdit::singleline(&mut self.collection_name)
-                                .hint_text("Collection name")
+                                .hint_text("Collection name, e.g. My favourites")
                                 .vertical_align(egui::Align::Center),
                         );
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
                                 !self.collection_name.trim().is_empty(),
@@ -2327,10 +2370,22 @@ impl MapManagerApp {
 
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Export TSV").on_hover_text("Write selected maps to selected_maps.tsv in the app data folder").clicked() {
+                        if ui.button("Export list (.tsv)").on_hover_text("Write the selected maps to a plain-text spreadsheet list (TSV = tab-separated values, opens in Excel or Google Sheets) in the app data folder").clicked() {
                             self.export_manifest();
                         }
-                        if ui.button("Restore backup").on_hover_text("Restore collection.db from collection.db.bak").clicked() {
+                        let backup = collection_backup_info(self.collection_db_path());
+                        let undo_hover = match &backup {
+                            Some(info) => format!(
+                                "Undo the last save: restore the backup from {} ({} collection(s), {} map(s))",
+                                info.when, info.collections, info.maps
+                            ),
+                            None => "No backup yet — one is created automatically on the first save".to_owned(),
+                        };
+                        if ui
+                            .add_enabled(backup.is_some(), egui::Button::new("Undo last save"))
+                            .on_hover_text(undo_hover)
+                            .clicked()
+                        {
                             self.delete_confirmation = Some(DeleteIntent::RestoreBackup);
                         }
                         if ui
@@ -2456,7 +2511,17 @@ impl MapManagerApp {
             self.load_selected_collection_into_selection();
         }
         if save_selection {
-            self.save_selection_to_collection();
+            let name = self.collection_name.trim().to_owned();
+            let maps = self.selected_maps.len();
+            let hashes = self.selected_md5s.len();
+            let exists = self.collections.iter().any(|c| c.name == name);
+            self.collection_name = name.clone();
+            self.delete_confirmation = Some(DeleteIntent::SaveCollection {
+                name,
+                maps,
+                hashes,
+                exists,
+            });
         }
         if new_collection {
             self.create_collection(&self.collection_name.clone());
@@ -2485,13 +2550,35 @@ impl MapManagerApp {
                 ),
                 "Delete files",
             ),
-            DeleteIntent::RestoreBackup => (
-                "Restore collection backup?",
-                "Restore collection.db from collection.db.bak? Collections saved \
-                 since the last write will be lost."
-                    .to_owned(),
-                "Restore",
-            ),
+            DeleteIntent::RestoreBackup => {
+                let current_collections = self.collections.len();
+                let current_maps: usize = self.collections.iter().map(|c| c.hashes.len()).sum();
+                let message = match collection_backup_info(self.collection_db_path()) {
+                    Some(info) => format!(
+                        "Undo the last save and return to the backup from {}?\n\nBackup: {} collection(s), {} map(s).\nCurrent: {current_collections} collection(s), {current_maps} map(s).\n\nAnything saved since the backup will be lost.",
+                        info.when, info.collections, info.maps
+                    ),
+                    None => "No backup is available.".to_owned(),
+                };
+                ("Undo last save?", message, "Undo")
+            }
+            DeleteIntent::SaveCollection {
+                name,
+                maps,
+                hashes,
+                exists,
+            } => {
+                let message = if *exists {
+                    format!(
+                        "Overwrite collection \"{name}\" with the current selection?\n\n{maps} scanned map(s), {hashes} selected hash(es).\nThe previous contents will be replaced (a backup is kept for undo)."
+                    )
+                } else {
+                    format!(
+                        "Create collection \"{name}\" with the current selection?\n\n{maps} scanned map(s), {hashes} selected hash(es)."
+                    )
+                };
+                ("Save collection?", message, "Save")
+            }
         };
 
         let mut confirmed = false;
@@ -2518,6 +2605,10 @@ impl MapManagerApp {
                 DeleteIntent::Collection(_) => self.delete_selected_collection(),
                 DeleteIntent::NonStdModes(_) => self.delete_selected_non_std_modes(),
                 DeleteIntent::RestoreBackup => self.restore_collection_backup(),
+                DeleteIntent::SaveCollection { name, .. } => {
+                    self.collection_name = name;
+                    self.save_selection_to_collection();
+                }
             }
         }
     }
@@ -2786,6 +2877,10 @@ impl eframe::App for MapManagerApp {
             .exact_width(320.0)
             .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
+                // Solid (space-reserving) scrollbars here: the sidebar is full
+                // of edge-to-edge fields and rails, which a floating bar would
+                // paint over.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
                     AppTab::Library => {
                     ui.heading("Library");
@@ -2804,7 +2899,6 @@ impl eframe::App for MapManagerApp {
                             if ui.button("⏹ Stop scan").clicked() {
                                 self.stop_scan();
                             }
-                            ui.add(egui::Spinner::new());
                         } else if ui.button("⟳ Scan library").clicked() {
                             self.start_scan();
                         }
@@ -2840,7 +2934,7 @@ impl eframe::App for MapManagerApp {
                     egui::CollapsingHeader::new("⭐ Difficulty")
                         .default_open(true)
                         .show(ui, |ui| {
-                            muted_label(ui, "Enable, then drag the range.");
+                            muted_label(ui, "Enable, then drag the range. Drag a number for fine tuning (Shift = extra fine).");
                             filter_range_row(ui, "Stars", &mut self.filters.stars, STARS_RANGE, 0.1, 1);
                             filter_range_row(ui, "AR", &mut self.filters.ar, AR_RANGE, 0.1, 1);
                             filter_range_row(ui, "CS", &mut self.filters.cs, CS_RANGE, 0.1, 1);
@@ -2940,6 +3034,27 @@ impl eframe::App for MapManagerApp {
                         muted_label(
                             ui,
                             "• “Save” overwrites the named collection with the selection.\n• “Add to” appends the selection.\n• Close osu! before writing collection.db.",
+                        );
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Undo").strong());
+                        match collection_backup_info(self.collection_db_path()) {
+                            Some(info) => muted_label(
+                                ui,
+                                format!(
+                                    "“Undo last save” returns to the backup from {} ({} collection(s), {} map(s)). A fresh backup is written on every save.",
+                                    info.when, info.collections, info.maps
+                                ),
+                            ),
+                            None => muted_label(
+                                ui,
+                                "No backup yet — one is written on the first save.",
+                            ),
+                        }
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Export").strong());
+                        muted_label(
+                            ui,
+                            "“Export list (.tsv)” writes the selection as a plain-text spreadsheet list (tab-separated values — opens in Excel or Google Sheets).",
                         );
                     }
                     AppTab::Maintenance => {
@@ -3564,13 +3679,6 @@ impl eframe::App for MapManagerApp {
             .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if self.is_scanning
-                        || self.is_repairing
-                        || self.is_checking_updates
-                        || self.is_updating
-                    {
-                        ui.add(egui::Spinner::new());
-                    }
                     let status = if self.is_scanning {
                         scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps)
                     } else if self.is_repairing && !self.repair_progress.is_empty() {
@@ -4063,18 +4171,12 @@ fn filter_range_row(
         });
     });
     let previous = (filter.min, filter.max);
-    ui.add_enabled(
-        filter.enabled,
-        egui::Slider::new(&mut filter.min, bounds.0..=bounds.1)
-            .step_by(step)
-            .text("Min"),
-    );
-    ui.add_enabled(
-        filter.enabled,
-        egui::Slider::new(&mut filter.max, bounds.0..=bounds.1)
-            .step_by(step)
-            .text("Max"),
-    );
+    ui.add_enabled_ui(filter.enabled, |ui| {
+        slow_range_row(ui, &mut filter.min, bounds, step, decimals, "Min");
+    });
+    ui.add_enabled_ui(filter.enabled, |ui| {
+        slow_range_row(ui, &mut filter.max, bounds, step, decimals, "Max");
+    });
     // Keep min <= max, moving the bound the user just dragged.
     if filter.min != previous.0 && filter.min > filter.max {
         filter.max = filter.min;
@@ -4082,6 +4184,128 @@ fn filter_range_row(
     if filter.max != previous.1 && filter.max < filter.min {
         filter.min = filter.max;
     }
+}
+
+/// One filter bound: caption, exact value box, and a rail. The rail is a
+/// relative drag — the handle deliberately lags the cursor at 70% of the
+/// cursor travel mapped onto the range, instead of sticking to the pointer.
+/// The value box keeps the slow absolute drag from before (Shift = 10x
+/// slower) plus arrow-key stepping for exact values.
+fn slow_range_row(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    bounds: (f32, f32),
+    step: f64,
+    decimals: usize,
+    caption: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.label(caption);
+        ui.add_sized(
+            [64.0, 20.0],
+            egui::DragValue::new(value)
+                .clamp_range(bounds.0..=bounds.1)
+                .speed((bounds.1 - bounds.0) as f64 / 1000.0)
+                .max_decimals(decimals),
+        );
+        let _ = relative_rail(ui, value, bounds, step);
+    });
+}
+
+/// Drag state for one rail, keyed by widget id. Travel is accumulated (in
+/// units of rail widths) instead of applied per frame, so a single glitch
+/// frame — pointer warp, hitch, coalesced events — can never teleport the
+/// value: per-frame travel is clamped and the total always equals pointer
+/// travel times the speed factor.
+#[derive(Debug, Clone, Copy)]
+struct RailDrag {
+    start_value: f32,
+    travel: f32,
+    applied_value: f32,
+}
+
+fn relative_rail(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    bounds: (f32, f32),
+    step: f64,
+) -> egui::Response {
+    const SPEED_FACTOR: f32 = 0.7;
+    /// No single frame may move the value more than this fraction of the
+    /// range, however large its pointer delta claims to be.
+    const MAX_FRAME_TRAVEL: f32 = 0.35;
+
+    let (min, max) = bounds;
+    let span = (max - min).max(f32::EPSILON);
+    let (rect, mut response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(40.0), 20.0),
+        egui::Sense::drag(),
+    );
+    response = response.on_hover_and_drag_cursor(egui::CursorIcon::ResizeHorizontal);
+    let id = response.id;
+
+    if response.drag_started() {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                id,
+                RailDrag {
+                    start_value: *value,
+                    travel: 0.0,
+                    applied_value: *value,
+                },
+            )
+        });
+    }
+    if response.dragged() {
+        let frame_travel = (response.drag_delta().x / rect.width().max(1.0))
+            .clamp(-MAX_FRAME_TRAVEL, MAX_FRAME_TRAVEL);
+        let mut drag: RailDrag = ui.data_mut(|data| data.get_temp(id)).unwrap_or(RailDrag {
+            start_value: *value,
+            travel: 0.0,
+            applied_value: *value,
+        });
+        // Another control (e.g. min/max coupling) may have moved the value
+        // mid-drag: rebase instead of fighting it.
+        if *value != drag.applied_value {
+            drag.start_value = *value;
+            drag.travel = 0.0;
+        }
+        drag.travel += frame_travel;
+        let mut next = (drag.start_value + drag.travel * span * SPEED_FACTOR).clamp(min, max);
+        if step > 0.0 {
+            let step = step as f32;
+            next = ((next / step).round() * step).clamp(min, max);
+        }
+        drag.applied_value = next;
+        ui.data_mut(|data| data.insert_temp(id, drag));
+        if next != *value {
+            *value = next;
+            response.mark_changed();
+        }
+    }
+    if response.drag_stopped() {
+        ui.data_mut(|data| data.remove::<RailDrag>(id));
+    }
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let center_y = rect.center().y;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), center_y - 3.0),
+                egui::pos2(rect.right(), center_y + 3.0),
+            ),
+            3.0,
+            visuals.bg_fill,
+        );
+        let t = (*value - min) / span;
+        ui.painter().circle_filled(
+            egui::pos2(rect.left() + t * rect.width(), center_y),
+            7.0,
+            visuals.fg_stroke.color,
+        );
+    }
+    response
 }
 
 fn fix_ui_width(ui: &mut egui::Ui, width: f32) {
@@ -4894,6 +5118,112 @@ mod tests {
             derive_osu_root("C:\\Games\\osu!"),
             "C:\\Games\\osu!".to_owned()
         );
+    }
+
+    fn drive_rail_frame(
+        value: &mut f32,
+        rail_rect: &mut egui::Rect,
+        ctx: &egui::Context,
+        frame_no: u32,
+        bounds: (f32, f32),
+        events: Vec<egui::Event>,
+    ) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(f64::from(frame_no) / 60.0),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                *rail_rect = relative_rail(ui, value, bounds, 0.1).rect;
+            });
+        });
+    }
+
+    #[test]
+    fn relative_rail_slow_drag_is_smooth_and_bounded() {
+        use egui::{Event, Modifiers, PointerButton, Rect, Vec2};
+
+        let ctx = egui::Context::default();
+        let mut value = 6.0_f32;
+        let bounds = (0.0_f32, 12.0_f32);
+        let mut rail_rect = Rect::NOTHING;
+        let mut frame_no = 0_u32;
+        let mut next_frame = |value: &mut f32, rail_rect: &mut Rect, events: Vec<Event>| {
+            frame_no += 1;
+            drive_rail_frame(value, rail_rect, &ctx, frame_no, bounds, events);
+        };
+
+        // Layout frame: no input, just learn where the rail is.
+        next_frame(&mut value, &mut rail_rect, vec![]);
+        assert!(rail_rect.width() > 100.0);
+        let press_pos = rail_rect.center();
+
+        // Press on the rail.
+        next_frame(
+            &mut value,
+            &mut rail_rect,
+            vec![Event::PointerButton {
+                pos: press_pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::default(),
+            }],
+        );
+        assert_eq!(value, 6.0);
+
+        // Slow drag: 2px per frame. Every frame must move a little — never a
+        // multi-unit jump.
+        let mut previous = value;
+        for step in 1..=60 {
+            next_frame(
+                &mut value,
+                &mut rail_rect,
+                vec![Event::PointerMoved(
+                    press_pos + Vec2::new(step as f32 * 2.0, 0.0),
+                )],
+            );
+            let delta = (value - previous).abs();
+            assert!(delta <= 3.1, "frame {step}: jumped {delta}");
+            assert!((0.0..=12.0).contains(&value));
+            previous = value;
+        }
+        // Total applied travel tracks pointer travel times the 0.7 factor.
+        let expected = 6.0 + (120.0 / rail_rect.width()) * 12.0 * 0.7;
+        assert!(
+            (value - expected).abs() < 0.2,
+            "value {value}, expected ~{expected}"
+        );
+
+        // Teleport frame: 500px in one frame must be clamped, not applied.
+        let before = value;
+        next_frame(
+            &mut value,
+            &mut rail_rect,
+            vec![Event::PointerMoved(press_pos + Vec2::new(620.0, 0.0))],
+        );
+        assert!(
+            (value - before).abs() <= 3.1,
+            "teleport jumped {}",
+            (value - before).abs()
+        );
+
+        // Release: value stays put.
+        next_frame(
+            &mut value,
+            &mut rail_rect,
+            vec![Event::PointerButton {
+                pos: press_pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+        assert!((0.0..=12.0).contains(&value));
     }
 
     #[test]

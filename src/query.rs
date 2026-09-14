@@ -41,9 +41,13 @@ impl RangeFilter {
         value.is_some_and(|value| value >= self.min && value <= self.max)
     }
 
-    /// osu!web-style tokens (`stars>=6 stars<=8`). Only emitted when enabled.
+    /// osu!web-style tokens (`stars>=6 stars<=8`). Only emitted when enabled
+    /// and narrowed: a full-range filter constrains nothing worth showing.
     fn tokens(&self, key: &str, full: (f32, f32)) -> Vec<String> {
         if !self.enabled {
+            return Vec::new();
+        }
+        if self.min <= full.0 && self.max >= full.1 {
             return Vec::new();
         }
         let mut tokens = Vec::new();
@@ -52,9 +56,6 @@ impl RangeFilter {
         }
         if self.max < full.1 {
             tokens.push(format!("{key}<={}", trim_number(self.max)));
-        }
-        if tokens.is_empty() {
-            tokens.push(format!("{key}>={}", trim_number(self.min)));
         }
         tokens
     }
@@ -135,7 +136,7 @@ pub struct BeatmapFilters {
 
 impl BeatmapFilters {
     pub fn with_full_ranges() -> Self {
-        Self {
+        let mut filters = Self {
             stars: RangeFilter::new(STARS_RANGE.0, STARS_RANGE.1),
             ar: RangeFilter::new(AR_RANGE.0, AR_RANGE.1),
             cs: RangeFilter::new(CS_RANGE.0, CS_RANGE.1),
@@ -143,7 +144,14 @@ impl BeatmapFilters {
             hp: RangeFilter::new(HP_RANGE.0, HP_RANGE.1),
             bpm: RangeFilter::new(BPM_RANGE.0, BPM_RANGE.1),
             ..Self::default()
-        }
+        };
+        // Stars, AR and CS are on by default at full range. Note an enabled
+        // filter still hides maps whose value is unknown (e.g. a failed star
+        // calculation).
+        filters.stars.enabled = true;
+        filters.ar.enabled = true;
+        filters.cs.enabled = true;
+        filters
     }
 
     pub fn matches_local(&self, map: &LocalBeatmap) -> bool {
@@ -343,17 +351,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_filters_match_everything_except_mode() {
+    fn default_filters_match_std_maps_with_known_values() {
         let query = filters();
+        assert!(query.stars.enabled);
+        assert!(query.ar.enabled);
+        assert!(query.cs.enabled);
+        assert!(!query.od.enabled);
+
         let map = LocalBeatmap {
             artist: "Camellia".into(),
             mode: None,
+            stars: Some(5.0),
+            ar: Some(9.0),
+            cs: Some(4.0),
             ..Default::default()
         };
         assert!(query.matches_local(&map));
 
+        // Unknown values never match an enabled filter.
+        let unknown_stars = LocalBeatmap {
+            mode: None,
+            ar: Some(9.0),
+            cs: Some(4.0),
+            ..Default::default()
+        };
+        assert!(!query.matches_local(&unknown_stars));
+
         let taiko = LocalBeatmap {
             mode: Some(1),
+            stars: Some(5.0),
+            ar: Some(9.0),
+            cs: Some(4.0),
             ..Default::default()
         };
         assert!(!query.matches_local(&taiko));
@@ -366,6 +394,8 @@ mod tests {
         query.stars.enabled = true;
         query.stars.min = 5.0;
         query.stars.max = 7.0;
+        query.ar.enabled = false;
+        query.cs.enabled = false;
         query.length_min = "60".into();
         query.length_max = "not a number".into();
 
