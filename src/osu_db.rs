@@ -11,6 +11,7 @@ pub struct DbBeatmapMeta {
     pub md5: String,
     pub osu_filename: String,
     pub standard_stars: Option<f32>,
+    pub ranked_status: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,7 +70,7 @@ fn read_beatmap(reader: &mut DbReader<'_>, version: i32) -> Result<Option<DbBeat
     reader.string()?;
     let md5 = reader.string()?;
     let osu_filename = reader.string()?;
-    reader.u8()?;
+    let ranked_status = Some(reader.u8()?);
     reader.i16()?;
     reader.i16()?;
     reader.i16()?;
@@ -130,6 +131,7 @@ fn read_beatmap(reader: &mut DbReader<'_>, version: i32) -> Result<Option<DbBeat
         md5,
         osu_filename,
         standard_stars,
+        ranked_status,
     }))
 }
 

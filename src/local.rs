@@ -43,6 +43,8 @@ pub struct LocalBeatmap {
     pub length_seconds: Option<f32>,
     pub circles: u32,
     pub sliders: u32,
+    #[serde(default)]
+    pub ranked_status: Option<u8>,
 }
 
 impl LocalBeatmap {
@@ -255,11 +257,15 @@ fn scan_songs_dir_streaming_inner(
             ) {
                 Ok(mut map) => {
                     if let Some(index) = &db_index
-                        && map.stars.is_none()
                         && let Some(file_name) = map.path.file_name().and_then(|file| file.to_str())
                         && let Some(meta) = index.get(&map.md5, file_name)
                     {
-                        map.stars = meta.standard_stars;
+                        if map.stars.is_none() {
+                            map.stars = meta.standard_stars;
+                        }
+                        if map.ranked_status.is_none() {
+                            map.ranked_status = meta.ranked_status;
+                        }
                     }
                     if map.stars.is_none() && map.mode.unwrap_or(0) == 0 {
                         map.stars = calculate_stars_for_path_with_timeout(
@@ -512,6 +518,7 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
         length_seconds: last_object_time.map(|time| time as f32 / 1000.0),
         circles,
         sliders,
+        ranked_status: None,
     })
 }
 

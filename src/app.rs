@@ -455,7 +455,8 @@ impl MapManagerApp {
         } else {
             "Not signed in with osu!".to_owned()
         };
-        let filters = BeatmapFilters::with_full_ranges();
+        let mut filters = BeatmapFilters::with_full_ranges();
+        filters.init_query_text();
         let cached_scan = load_scan_cache(&osu_root).ok().flatten();
         let cached_status = cached_scan.as_ref().map(|scan| {
             let matching_maps = scan
@@ -2931,6 +2932,8 @@ impl eframe::App for MapManagerApp {
                     muted_label(ui, "A map must pass every active filter.");
                     ui.add_space(6.0);
 
+                    let ui_filter_snapshot = self.filters.ui_snapshot();
+
                     egui::CollapsingHeader::new("⭐ Difficulty")
                         .default_open(true)
                         .show(ui, |ui| {
@@ -2990,6 +2993,11 @@ impl eframe::App for MapManagerApp {
                                     }
                                 });
                         });
+
+                    if self.filters.ui_snapshot() != ui_filter_snapshot {
+                        self.filters.update_query_text_from_ui();
+                    }
+
                     egui::CollapsingHeader::new("⚙ Advanced")
                         .default_open(false)
                         .show(ui, |ui| {
@@ -2997,13 +3005,15 @@ impl eframe::App for MapManagerApp {
                             ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("osu! search text").strong());
-                            let mut query_text = self.filters.to_osu_search();
-                            ui.add_sized(
+                            let search_edit = ui.add_sized(
                                 [ui.available_width(), 56.0],
-                                egui::TextEdit::multiline(&mut query_text)
-                                    .interactive(false)
-                                    .hint_text("No filters — matches everything"),
+                                egui::TextEdit::multiline(&mut self.filters.query_text)
+                                    .interactive(true)
+                                    .hint_text("artist=\"LiSA\" stars>=5.5 length<=2:30 mode=osu status=ranked..."),
                             );
+                            if search_edit.changed() {
+                                self.filters.sync_ui_from_query_text();
+                            }
                         });
                     if self.filters.mode != ModeFilter::Any {
                         let mode = self.filters.mode;
@@ -5366,6 +5376,7 @@ mod tests {
             length_seconds: None,
             circles: 0,
             sliders: 0,
+            ranked_status: None,
         };
         let maps = vec![
             map_with(None),
